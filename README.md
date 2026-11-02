@@ -41,7 +41,7 @@ The virtio-gpu device needs `venus`, `blob` and a `hostmem` window:
 ```
 
 On Intel hosts with a discrete GPU, KVM must honor the guest's page attribute table (PAT). This keeps the guest
-CPU mappings consistent with the host's cache attributes. Use Linux 6.16 or later and a QEMU build with the
+CPU mappings consistent with the host's cache attributes. Use Linux 6.16 or later and QEMU 11.0 or later with the
 `honor-guest-pat` option, as described in [Mesa's Venus requirements](https://docs.mesa3d.org/drivers/venus.html).
 Add `honor-guest-pat=on` to the existing `-accel kvm` argument. Without it, CPU uploads can contain stale data,
 which can cause corrupted desktop surfaces and cursors even when Vulkan device creation succeeds.
