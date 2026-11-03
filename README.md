@@ -80,6 +80,9 @@ With libvirt, which has no attribute for `venus`, set it through an override on 
 </qemu:override>
 ```
 
+For a complete virt-manager setup, including a persistent guest PAT option and Virtio tablet input,
+see [virt-manager and SPICE](docs/virt-manager.md).
+
 For lower input latency, we recommend virtio input devices in place of the emulated PS/2 and USB ones (the guest
 needs virtio-win's `vioinput` driver). If convenient, also avoid virt-manager and spice display, in favor of QEMU GTK window.
 
