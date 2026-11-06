@@ -1,6 +1,6 @@
 # Office shared surfaces
 
-This change repairs shared-texture imports and completes rendering before a keyed-mutex handoff.
+This change repairs shared-texture imports, completes shared handoffs, and fixes legacy blt presentation.
 Tests on one Windows 11 VM now show intact Office ribbons and document surfaces during page changes and window resizing.
 Office rejects document creation and editing because its license expired. Editing remains untested.
 These results cover the tested documents and actions. They do not establish general Office compatibility.
@@ -43,25 +43,43 @@ The entry point now emits deferred clears and waits for rendering to complete be
 This wait is necessary because DXVK submits Vulkan work through a different kernel device from the runtime's synchronization context.
 The runtime can then transfer the surface to its next owner with current pixels.
 
+## Legacy presentation
+
+An isolated blt swapchain removed its device on the second frame with `DXGI_ERROR_DEVICE_HUNG`.
+DxgKrnl ETW reported that its source allocation was not requested to be resident.
+The driver now makes presentation allocations resident and waits for pending paging operations.
+It holds one residency reference per allocation until deallocation, including across resource-identity rotation.
+See [MakeResident](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dumddi/nc-d3dumddi-pfnd3dddi_makeresidentcb).
+
+Residency alone allowed 120 successful presents, but the window remained black.
+Legacy blt surfaces now use host-visible, coherent memory for the kernel's CPU copy.
+The kernel selects that copy path for a blob source and maps aliases through their original allocation.
+That allocation owns the shared-memory range and its mapping.
+The Present boundary also emits deferred clears before rendering completion.
+
+Each presentation model needs a separate test window.
+Windows stops displaying legacy blt updates on a window after flip presentation, even after the flip swapchain is destroyed.
+See [DXGI_SWAP_EFFECT](https://learn.microsoft.com/windows/win32/api/dxgi/ne-dxgi-dxgi_swap_effect).
+
 ## Tests
 
 Build from the repository development shell:
 
 ```sh
-nix develop --command bash -c 'export VGD_REAL_NINJA=$(command -v ninja); cmake --build build/win --target vgd3d11 vgd3d12 d3d11probe -j 4'
+nix develop --command bash -c 'export VGD_REAL_NINJA=$(command -v ninja); cmake --build build/win --target vgd3d11 vgd3d12 d3d11probe -j 4 && cmake --build build/kmd -j 4'
 ```
 
 Take a VM snapshot before driver installation. Use the README installation procedure, then reboot Windows.
 Run the probe from the logged-in desktop:
 
 ```powershell
-.\d3d11probe.exe
+.\d3d11probe.exe --present-check
 $LASTEXITCODE
 ```
 
 On 2026-11-06, the probe passed with exit code `0` on Windows 11 26H1:
 
-- Clear, triangle, textured draw, depth/MSAA, compute, queries, and map/update.
+- Clear, triangle, textured draw with fractional channel values, depth/MSAA, compute, queries, and map/update.
 - Legacy sharing across devices and processes, reopening on the creator device, and reading after the exporter releases its resource.
 - NT keyed-mutex sharing with no explicit producer `Flush`.
 - Sixteen frames on a `257x131` shared texture, with full pattern updates and dirty rectangles in both directions.
@@ -69,12 +87,15 @@ On 2026-11-06, the probe passed with exit code `0` on Windows 11 26H1:
 
 Before the handoff fix, the last two tests failed with zero pixels. After installation and reboot, both passed.
 The cross-process child also passed its pixel checks and exited with code `0`.
+Flip-discard, blt-discard, and flip-sequential after `ResizeBuffers` each completed 120 frames in separate windows.
+Two screen samples per mode matched a separate GDI reference within three byte values per channel.
+This comparison includes the user's active desktop color filter. Keep both test windows visible.
 
 ### Office desktop checks
 
-The VM runs Office 2021 `16.0.14334.20806` and driver package `1.0.26310.1855` (`oem21.inf`).
-DWM loaded the new package after a normal reboot at guest time `2026-11-06T18:56:30`.
-The package retains the original Vulkan ICD and kernel driver.
+The VM runs Office 2021 `16.0.14334.20806` and driver package `1.0.26310.2109`.
+The final desktop check followed a normal Windows reboot.
+The package uses the updated kernel driver and retains the stable Vulkan ICD.
 
 The desktop tests opened synthetic DOCX, XLSX, and PPTX files:
 
@@ -89,10 +110,8 @@ Office refused COM calls to create or edit documents because its license expired
 ## Remaining limits
 
 - `Flush` and shared-resource handoffs wait for GPU completion on the CPU. This fallback needs throughput tests.
-- `--present` completes 120 flip-discard frames, then fails during blt-discard with `DXGI_ERROR_DEVICE_REMOVED`.
-  `--present-blt` also fails without a prior flip swapchain. Its removal reason is `DXGI_ERROR_DEVICE_HUNG`.
-  The later resize phase fails after device removal. The regression status remains unknown.
+- Legacy blt uses a CPU copy. Its throughput needs measurement.
 - Direct3D 12 imports have build coverage only.
 - Task Manager GPU utilization, cursor duplication, and display scaling need separate tests.
 
-Keep the pull request as a draft while presentation failures and the remaining compatibility limits need review.
+Keep the pull request as a draft while the remaining compatibility limits need review.

@@ -24,6 +24,11 @@ void APIENTRY destroy_device(D3D10DDI_HDEVICE h)
     }
     if (d->idle_event)
         CloseHandle(d->idle_event);
+    if (d->paging_queue) {
+        D3DDDI_DESTROYPAGINGQUEUE queue{d->paging_queue};
+        if (FAILED(d->kt.pfnDestroyPagingQueueCb(d->rt_device.handle, &queue)))
+            VGD_WARN("DestroyDevice: DestroyPagingQueueCb failed");
+    }
     d->~Device();
 }
 
@@ -94,6 +99,7 @@ HRESULT create_device(D3D10DDIARG_CREATEDEVICE& args, const viogpu::AdapterInfo&
     d->um = *args.p11UMCallbacks;
     d->dxgi = args.DXGIBaseDDI.pDXGIBaseCallbacks;
     d->allocation_alias = info.Flags.supports_allocation_alias;
+    d->explicit_residency = info.Flags.requires_explicit_residency;
     d->d3d = std::move(d3d);
     Com<ID3D11DeviceContext> ctx;
     d->d3d->GetImmediateContext(ctx.put());

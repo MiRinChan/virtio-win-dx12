@@ -30,6 +30,8 @@ struct Device {
     VulkanDevice vulkan;                              // DXVK's device, for images on shared memory
     // The KMD understands viogpu::AllocationAlias (our patch): shared surfaces and primaries can be created.
     bool allocation_alias = false;
+    bool explicit_residency = false;
+    D3DKMT_HANDLE paging_queue = 0, paging_fence = 0;
     std::unique_ptr<KmtDevice> kmt;                   // created on first use (kmt.h)
     HANDLE present_context = nullptr;                 // a kernel context of the runtime's, for presents
     HANDLE idle_event = nullptr;                      // set by DXVK when a flush completes (wait_idle)
@@ -87,6 +89,7 @@ struct ResourceObject {
     D3DKMT_HANDLE allocation = 0;
     D3D10DDI_HRTRESOURCE rt_resource{};
     bool allocated = false;
+    bool present_resident = false;
     // Views of it, recreated when RotateResourceIdentities swaps its storage (present buffers only).
     std::vector<ViewObject*> views;
 

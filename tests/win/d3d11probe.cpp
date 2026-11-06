@@ -4,10 +4,12 @@
 //   --present  also show swapchains in a window for a few seconds each (watch them): flip model, then the legacy
 //              blt model, then ResizeBuffers.
 //   --present-blt  run the legacy presentation phase without a prior flip swapchain.
+//   --present-check  compare visible colours with a GDI reference. Keep both windows uncovered.
 #include <windows.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
+#include <dwmapi.h>
 
 #include <cmath>
 #include <cstdint>
@@ -258,7 +260,7 @@ bool textured_test(ID3D11Device* dev, ID3D11DeviceContext* ctx)
         return result(t, false);
     Ref<ID3D11VertexShader> vs;
     Ref<ID3D11PixelShader> ps;
-    const uint32_t texels_in[4] = {0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff};
+    const uint32_t texels_in[4] = {0xff8040bf, 0xff80bf40, 0xff4080bf, 0xffbf8040};
     D3D11_TEXTURE2D_DESC td{2, 2, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_IMMUTABLE,
                             D3D11_BIND_SHADER_RESOURCE, 0, 0};
     D3D11_SUBRESOURCE_DATA ti{texels_in, 8, 0};
@@ -287,9 +289,9 @@ bool textured_test(ID3D11Device* dev, ID3D11DeviceContext* ctx)
     ctx->Draw(3, 0);
     std::vector<uint32_t> texels;
     UINT w;
-    bool ok = read_back(dev, ctx, tex, &texels, &w) && expect_texel(t, texels, w, 8, 8, 0xff0000ff) &&
-              expect_texel(t, texels, w, 56, 8, 0xff00ff00) && expect_texel(t, texels, w, 8, 56, 0xffff0000) &&
-              expect_texel(t, texels, w, 56, 56, 0xffffffff);
+    bool ok = read_back(dev, ctx, tex, &texels, &w) && expect_texel(t, texels, w, 8, 8, texels_in[0]) &&
+              expect_texel(t, texels, w, 56, 8, texels_in[1]) && expect_texel(t, texels, w, 8, 56, texels_in[2]) &&
+              expect_texel(t, texels, w, 56, 56, texels_in[3]);
     ctx->ClearState();
     return result(t, ok);
 }
@@ -761,9 +763,26 @@ void pump_messages()
     }
 }
 
-// Swapchains in a window (watch them): flip model, the legacy blt model, then flip model again after
-// ResizeBuffers. Each phase cycles colours for about two seconds.
-bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter, bool blt_only)
+COLORREF reference_color = RGB(0, 0, 0);
+
+LRESULT CALLBACK reference_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        HBRUSH brush = CreateSolidBrush(reference_color);
+        FillRect(dc, &paint.rcPaint, brush);
+        DeleteObject(brush);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+// Each model uses a fresh window. After flip presentation, Windows ignores
+// legacy blt updates to that HWND even after the flip swapchain is destroyed.
+bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter, bool blt_only,
+                  bool check_screen)
 {
     const char* t = "present";
     Ref<IDXGIFactory2> factory;
@@ -774,8 +793,19 @@ bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* ada
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"d3d11probe";
     RegisterClassW(&wc);
-    HWND wnd = CreateWindowW(L"d3d11probe", L"d3d11probe", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 640, 400,
-                             nullptr, nullptr, wc.hInstance, nullptr);
+    HWND reference = nullptr;
+    if (check_screen) {
+        WNDCLASSW reference_class{};
+        reference_class.lpfnWndProc = reference_window_proc;
+        reference_class.hInstance = wc.hInstance;
+        reference_class.lpszClassName = L"d3d11probe-reference";
+        RegisterClassW(&reference_class);
+        reference = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                                     reference_class.lpszClassName, L"GDI colour reference", WS_POPUP | WS_VISIBLE,
+                                     800, 100, 160, 160, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!reference)
+            return result(t, false);
+    }
     struct Phase {
         const char* name;
         DXGI_SWAP_EFFECT effect;
@@ -788,6 +818,19 @@ bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* ada
     for (const Phase& p : phases) {
         if (blt_only && p.effect != DXGI_SWAP_EFFECT_DISCARD)
             continue;
+        struct Window {
+            HWND handle;
+            ~Window() { if (handle) DestroyWindow(handle); }
+        } window{CreateWindowW(wc.lpszClassName, L"d3d11probe", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                100, 100, 640, 400, nullptr, nullptr, wc.hInstance, nullptr)};
+        const HWND wnd = window.handle;
+        if (!wnd) {
+            ok = false;
+            continue;
+        }
+        SetForegroundWindow(wnd);
+        if (check_screen)
+            SetWindowPos(wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         DXGI_SWAP_CHAIN_DESC1 sd{};
         sd.Width = p.width;
         sd.Height = p.height;
@@ -827,13 +870,47 @@ bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* ada
             }
             presented++;
             pump_messages();
+            if (check_screen && (frame == 30 || frame == 90)) {
+                const int red = static_cast<int>(std::lround(color[0] * 255));
+                const int green = static_cast<int>(std::lround(color[1] * 255));
+                const int blue = static_cast<int>(std::lround(color[2] * 255));
+                reference_color = RGB(red, green, blue);
+                InvalidateRect(reference, nullptr, FALSE);
+                UpdateWindow(reference);
+                DwmFlush();
+                RECT client{};
+                GetClientRect(wnd, &client);
+                POINT sample{client.right / 2, client.bottom / 2};
+                ClientToScreen(wnd, &sample);
+                const bool uncovered = GetAncestor(WindowFromPoint(sample), GA_ROOT) == wnd;
+                POINT reference_sample{80, 80};
+                ClientToScreen(reference, &reference_sample);
+                const bool reference_uncovered = GetAncestor(WindowFromPoint(reference_sample), GA_ROOT) == reference;
+                HDC screen = GetDC(nullptr);
+                const COLORREF pixel = GetPixel(screen, sample.x, sample.y);
+                const COLORREF expected = GetPixel(screen, reference_sample.x, reference_sample.y);
+                ReleaseDC(nullptr, screen);
+                // Both samples include the user's desktop colour filter.
+                const bool match = uncovered && reference_uncovered && pixel != CLR_INVALID && expected != CLR_INVALID &&
+                                   std::abs(int(GetRValue(pixel)) - int(GetRValue(expected))) <= 3 &&
+                                   std::abs(int(GetGValue(pixel)) - int(GetGValue(expected))) <= 3 &&
+                                   std::abs(int(GetBValue(pixel)) - int(GetBValue(expected))) <= 3;
+                std::printf("    %s: frame %u screen RGB %u,%u,%u GDI reference %u,%u,%u: %s\n", p.name, frame,
+                            GetRValue(pixel), GetGValue(pixel), GetBValue(pixel), GetRValue(expected),
+                            GetGValue(expected), GetBValue(expected),
+                            match ? "PASS" : "FAIL");
+                ok = ok && match;
+                if (!uncovered || !reference_uncovered)
+                    std::printf("    screen sample is covered by another window\n");
+            }
         }
         std::printf("    %s: %s: %u of 120 frames presented\n", t, p.name, presented);
         ok = ok && presented == 120;
         ctx->ClearState();
         ctx->Flush();
     }
-    DestroyWindow(wnd);
+    if (reference)
+        DestroyWindow(reference);
     return result(t, ok);
 }
 
@@ -847,15 +924,20 @@ int main(int argc, char** argv)
     std::printf("d3d11probe built " __DATE__ " " __TIME__ "\n");
     bool present = false;
     bool blt_only = false;
+    bool check_screen = false;
     HANDLE child_handle = nullptr;
     for (int i = 1; i < argc; i++)
         if (!std::strcmp(argv[i], "--present"))
             present = true;
         else if (!std::strcmp(argv[i], "--present-blt"))
             present = blt_only = true;
+        else if (!std::strcmp(argv[i], "--present-check"))
+            present = check_screen = true;
         else if (!std::strcmp(argv[i], "--shared-child") && i + 1 < argc)
             child_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(std::strtoull(argv[++i], nullptr, 10)));
 
+    if (check_screen)
+        SetProcessDPIAware();
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     g_compile = compiler ? reinterpret_cast<D3DCompileFn>(reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")))
                          : nullptr;
@@ -900,7 +982,7 @@ int main(int argc, char** argv)
         failures += !shared_nt_test(dev, ctx, adapter);
         failures += !shared_updates_test(dev, ctx, adapter);
         if (present)
-            failures += !present_test(dev, ctx, adapter, blt_only);
+            failures += !present_test(dev, ctx, adapter, blt_only, check_screen);
     }
     if (child_handle)
         return 1;

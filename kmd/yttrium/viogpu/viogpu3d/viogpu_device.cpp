@@ -382,7 +382,7 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
 
     if (pPresent->Flags.Blt)
     {
-        if (IsVenusContext())
+        if (IsVenusContext() || (src && src->IsBlob()))
         {
             NTSTATUS stageStatus =
                 cmd->SetCpuCopyBlt(src, dst, &pPresent->SrcRect,

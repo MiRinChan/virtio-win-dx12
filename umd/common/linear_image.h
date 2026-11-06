@@ -23,6 +23,7 @@ struct LinearImageDesc {
     // Further formats views of it may use (the image is then mutable).
     std::vector<VkFormat> view_formats;
     VkImageUsageFlags usage = 0;
+    VkMemoryPropertyFlags required_memory = 0;
     uint32_t width = 0, height = 0;
 };
 
