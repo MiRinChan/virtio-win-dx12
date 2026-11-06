@@ -8,12 +8,16 @@ add_executable(vkprobe vkprobe.cpp)
 target_link_libraries(vkprobe PRIVATE vgd-vulkan-headers)
 target_link_options(vkprobe PRIVATE -static -static-libgcc -static-libstdc++)
 
+add_executable(vkqueueprobe vkqueueprobe.cpp)
+target_link_libraries(vkqueueprobe PRIVATE vgd-vulkan-headers)
+target_link_options(vkqueueprobe PRIVATE -static -static-libgcc -static-libstdc++)
+
 add_executable(d3d11probe d3d11probe.cpp)
 target_link_libraries(d3d11probe PRIVATE d3d11 dxgi dxguid user32 gdi32 dwmapi)
 target_link_options(d3d11probe PRIVATE -static -static-libgcc -static-libstdc++)
 
 # The guest scripts next to the probes, so a copy of build/ is all the guest needs (they find the rest from there).
-foreach(script vgd-test.ps1 kmt-trace.wds)
+foreach(script vgd-test.ps1 kmt-trace.wds vkqueueprobe.ps1)
   configure_file(${script} ${script} COPYONLY)
 endforeach()
 
