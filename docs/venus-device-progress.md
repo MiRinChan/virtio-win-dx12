@@ -84,3 +84,18 @@ Windows execution counters remained zero during this load.
 
 The candidate ran only in explicit test processes. It has no installed Office or cold-desktop result.
 The separate WDDM accounting worker experiment still has its own destruction wait and remains outside the build patch list.
+
+## Integrated build
+
+The build that includes upstream commit `2a02922` also passes the isolated regression.
+It applies the upstream high-resolution sleep and initial-yield patches before the destruction-ring patch, now numbered 0010.
+The ICD SHA-256 hash is `8989d3aa3ef712e31f725aeb1aa8808c1e9ba7d9c2e202023cfea3cfad730e0d`.
+
+All five device modes and the single-device pending-wait mode passed without watchdog use.
+The load completed 219 submissions and checked all 8,388,608 words.
+GPU timestamp intervals totaled 9,621.085 ms over 10,016 ms, or 96.06%. Windows execution counters still remained zero.
+The ICD, OpenGL driver, KMD, UMDs, services, probes, and installer also built successfully.
+The host wrapper passed its shell syntax check. The cursor probe compiled with `-Wall -Wextra -Werror`.
+
+These checks do not install the integrated package or establish its desktop compatibility.
+The installed Office package remains the previously tested version.
