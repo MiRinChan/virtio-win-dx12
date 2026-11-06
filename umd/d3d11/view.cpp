@@ -188,7 +188,11 @@ void APIENTRY destroy_rtv(D3D10DDI_HDEVICE h, D3D10DDI_HRENDERTARGETVIEW hv) { d
 
 void APIENTRY clear_rtv(D3D10DDI_HDEVICE h, D3D10DDI_HRENDERTARGETVIEW hv, FLOAT color[4])
 {
-    Device::from(h)->ctx->ClearRenderTargetView(view_of<ID3D11RenderTargetView>(hv), color);
+    Device* d = Device::from(h);
+    d->ctx->ClearRenderTargetView(view_of<ID3D11RenderTargetView>(hv), color);
+    const auto* view = object<ViewObject>(hv);
+    if (view->resource->image && FAILED(dxvk::flush_shared_clears(d->d3d.get(), view->resource->resource.get())))
+        d->set_error(D3DDDIERR_DEVICEREMOVED);
 }
 
 // --- Depth/stencil views -----------------------------------------------------------------------------------
@@ -309,9 +313,13 @@ void APIENTRY copy_structure_count(D3D10DDI_HDEVICE h, D3D10DDI_HRESOURCE dst, U
 void APIENTRY clear_view(D3D10DDI_HDEVICE h, D3D11DDI_HANDLETYPE type, void* view, const FLOAT color[4],
                          const D3D10_DDI_RECT* rects, UINT count)
 {
-    if (type == D3D10DDI_HT_RENDERTARGETVIEW || type == D3D11DDI_HT_UNORDEREDACCESSVIEW)
-        Device::from(h)->ctx->ClearView(static_cast<ViewObject*>(view)->view.get(), color, rects, count);
-    else
+    if (type == D3D10DDI_HT_RENDERTARGETVIEW || type == D3D11DDI_HT_UNORDEREDACCESSVIEW) {
+        Device* d = Device::from(h);
+        const auto* v = static_cast<ViewObject*>(view);
+        d->ctx->ClearView(v->view.get(), color, rects, count);
+        if (v->resource->image && FAILED(dxvk::flush_shared_clears(d->d3d.get(), v->resource->resource.get())))
+            d->set_error(D3DDDIERR_DEVICEREMOVED);
+    } else
         VGD_WARN("ClearView: view type %d not supported", static_cast<int>(type));
 }
 

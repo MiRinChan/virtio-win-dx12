@@ -36,7 +36,7 @@ HRESULT surface_texture(Device& d, const D3D11_TEXTURE2D_DESC1& desc, int import
     if (FAILED(hr))
         return hr;
     Com<ID3D11Texture2D> tex;
-    hr = dxvk::texture_from_image(d.d3d.get(), desc, out.image->image(), tex.put());
+    hr = dxvk::texture_from_image(d.d3d.get(), desc, out.image->image(), !export_fd, tex.put());
     if (FAILED(hr)) {
         VGD_WARN("shared surface: DXVK did not take the image: 0x%08lx", hr);
         return hr;
@@ -154,7 +154,7 @@ HRESULT open_shared_surface(Device& d, const D3D10DDIARG_OPENRESOURCE& a, Resour
         VGD_WARN("OpenResource: only surfaces of known formats can be opened");
         return E_NOTIMPL;
     }
-    const int fd = import_fd("OpenResource", d.kernel(), a.hKMResource.handle);
+    const int fd = import_fd("OpenResource", d.kernel(), alloc->hAllocation, *e);
     if (fd < 0)
         return E_FAIL;
     out.dimension = D3D10DDIRESOURCE_TEXTURE2D;
@@ -162,6 +162,11 @@ HRESULT open_shared_surface(Device& d, const D3D10DDIARG_OPENRESOURCE& a, Resour
     out.width = width;
     out.height = height;
     HRESULT hr = surface_texture(d, surface_desc(format, width, height, bind), fd, e->Size, out, nullptr);
+    if (SUCCEEDED(hr)) {
+        // Opened resources also need DeallocateCb when their runtime view dies.
+        out.allocation = alloc->hAllocation;
+        out.allocated = true;
+    }
     if (FAILED(hr))
         VGD_WARN("OpenResource: import of %ux%u format %d failed: 0x%08lx", width, height, format, hr);
     return hr;

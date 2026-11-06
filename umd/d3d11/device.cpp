@@ -32,7 +32,11 @@ void APIENTRY relocate_device_funcs(D3D10DDI_HDEVICE, D3D11_1DDI_DEVICEFUNCS*) {
 
 BOOL APIENTRY flush(D3D10DDI_HDEVICE h, UINT flags)
 {
-    Device::from(h)->ctx->Flush();
+    // Rendering runs outside the runtime's scheduling context. Complete it
+    // before the runtime hands a shared resource to another device or process.
+    Device* d = Device::from(h);
+    if (FAILED(d->wait_idle()))
+        d->set_error(D3DDDIERR_DEVICEREMOVED);
     return TRUE;
 }
 
@@ -100,6 +104,19 @@ HRESULT create_device(D3D10DDIARG_CREATEDEVICE& args, const viogpu::AdapterInfo&
         d->~Device();
         return hr;
     }
+
+    // DXGI shared-resource synchronization needs a runtime context even when
+    // the device never presents. The Vulkan context belongs to another device.
+    D3DDDICB_CREATECONTEXT cc{};
+    cc.NodeOrdinal = 0;
+    cc.EngineAffinity = 1;
+    hr = d->kt.pfnCreateContextCb(d->rt_device.handle, &cc);
+    if (FAILED(hr) || !cc.hContext) {
+        VGD_WARN("CreateDevice: CreateContextCb failed: 0x%08lx", hr);
+        d->~Device();
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    d->present_context = cc.hContext;
 
     auto& t = *args.p11_1DeviceFuncs;
     VGD_FILL_STUBS(t, "device", VGD_SLOTS_D3D11_1_DEVICE);

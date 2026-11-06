@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cwchar>
 #include <cstring>
 #include <vector>
 
@@ -22,6 +24,24 @@ DWORD g_main_thread = 0;
 LONG CALLBACK report_crash(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* r = e->ExceptionRecord;
+    if (r->ExceptionCode == 0x87a) {
+        std::printf("DirectX exception, %lu parameters:\n", r->NumberParameters);
+        for (DWORD i = 0; i < r->NumberParameters; i++)
+            std::printf("  0x%llx\n", static_cast<unsigned long long>(r->ExceptionInformation[i]));
+        void* frames[32];
+        const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
+        for (USHORT i = 0; i < count; i++) {
+            HMODULE module = nullptr;
+            char path[MAX_PATH] = "?";
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCSTR>(frames[i]), &module);
+            if (module)
+                GetModuleFileNameA(module, path, MAX_PATH);
+            std::printf("  %s+0x%llx\n", path, static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(module)));
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
     HMODULE mod = nullptr;
@@ -42,10 +62,12 @@ struct Ref {
     T* p = nullptr;
     Ref() = default;
     Ref(const Ref&) = delete;
-    ~Ref()
+    ~Ref() { reset(); }
+    void reset()
     {
         if (p)
             p->Release();
+        p = nullptr;
     }
     T** put() { return &p; }
     T* operator->() const { return p; }
@@ -501,7 +523,50 @@ bool update_test(ID3D11Device* dev, ID3D11DeviceContext* ctx)
     return result(t, ok);
 }
 
-// A texture created shared on one device and opened on another: the path DWM takes to composite swapchains.
+bool shared_child(ID3D11Device* dev, ID3D11DeviceContext* ctx, HANDLE handle)
+{
+    Ref<ID3D11Texture2D> opened;
+    if (!check("shared child", "OpenSharedResource", dev->OpenSharedResource(handle, IID_PPV_ARGS(opened.put()))))
+        return false;
+    std::vector<uint32_t> texels;
+    UINT width;
+    return read_back(dev, ctx, opened, &texels, &width) &&
+           expect_texel("shared child", texels, width, 0, 0, 0xff00ffff) &&
+           expect_texel("shared child", texels, width, 95, 63, 0xff00ffff);
+}
+
+bool run_shared_child(HANDLE handle)
+{
+    wchar_t path[MAX_PATH], command[MAX_PATH + 80];
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!length || length >= MAX_PATH)
+        return false;
+    std::swprintf(command, std::size(command), L"\"%ls\" --shared-child %llu", path,
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(handle)));
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(path, command, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process))
+        return false;
+    const DWORD wait = WaitForSingleObject(process.hProcess, 15000);
+    DWORD code = 1;
+    if (wait == WAIT_OBJECT_0)
+        GetExitCodeProcess(process.hProcess, &code);
+    else {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    std::printf("shared child pid %lu: wait 0x%08lx, exit 0x%08lx\n", process.dwProcessId, wait, code);
+    return wait == WAIT_OBJECT_0 && code == 0;
+}
+
+// A texture shared across devices and processes, as DWM opens compositor surfaces.
 bool shared_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter)
 {
     const char* t = "shared";
@@ -522,18 +587,81 @@ bool shared_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adap
         !check(t, "QueryInterface(IDXGIResource)", tex->QueryInterface(IID_PPV_ARGS(dxgi.put()))) ||
         !check(t, "GetSharedHandle", dxgi->GetSharedHandle(&shared)))
         return result(t, false);
-    const float color[4] = {0.0f, 0.5f, 1.0f, 1.0f};
+    const float color[4] = {0.0f, 1.0f, 1.0f, 1.0f};
     ctx->ClearRenderTargetView(rtv, color);
     ctx->Flush();
+    const bool cross_process = result("shared cross-process", run_shared_child(shared));
     Ref<ID3D11Texture2D> opened;
     if (!check(t, "OpenSharedResource", dev2->OpenSharedResource(shared, IID_PPV_ARGS(opened.put()))))
         return result(t, false);
+    // Reopening on the creator exercises a different runtime allocation handle.
+    Ref<ID3D11Texture2D> same_device;
+    if (!check(t, "OpenSharedResource(same device)", dev->OpenSharedResource(shared, IID_PPV_ARGS(same_device.put()))))
+        return result(t, false);
     std::vector<uint32_t> texels;
     UINT w;
-    // B8G8R8A8: blue 0xff, green 0x80 (0.5 rounded), red 0.
-    bool ok = read_back(dev2, ctx2, opened, &texels, &w) && expect_texel(t, texels, w, 0, 0, 0xffff8000) &&
-              expect_texel(t, texels, w, 95, 63, 0xffff8000);
-    return result(t, ok);
+    // B8G8R8A8 in little-endian memory: blue and green 0xff, red 0.
+    bool ok = read_back(dev2, ctx2, opened, &texels, &w) && expect_texel(t, texels, w, 0, 0, 0xff00ffff) &&
+              expect_texel(t, texels, w, 95, 63, 0xff00ffff);
+    if (!ok)
+        return result(t, false);
+    ok = read_back(dev, ctx, same_device, &texels, &w) && expect_texel(t, texels, w, 0, 0, 0xff00ffff);
+    // An imported texture must retain the blob after the exporting resource dies.
+    rtv.reset();
+    dxgi.reset();
+    tex.reset();
+    same_device.reset();
+    ctx->ClearState();
+    ctx->Flush();
+    ok = ok && read_back(dev2, ctx2, opened, &texels, &w) && expect_texel(t, texels, w, 95, 63, 0xff00ffff);
+    return result(t, ok && cross_process);
+}
+
+bool shared_nt_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter)
+{
+    const char* t = "shared NT";
+    D3D11_TEXTURE2D_DESC desc{96, 64, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
+                              D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX};
+    Ref<ID3D11Texture2D> tex;
+    Ref<ID3D11RenderTargetView> rtv;
+    Ref<IDXGIResource1> resource;
+    Ref<IDXGIKeyedMutex> producer;
+    if (!check(t, "CreateTexture2D", dev->CreateTexture2D(&desc, nullptr, tex.put())) ||
+        !check(t, "CreateRenderTargetView", dev->CreateRenderTargetView(tex, nullptr, rtv.put())) ||
+        !check(t, "IDXGIResource1", tex->QueryInterface(IID_PPV_ARGS(resource.put()))) ||
+        !check(t, "IDXGIKeyedMutex", tex->QueryInterface(IID_PPV_ARGS(producer.put()))))
+        return result(t, false);
+    HANDLE handle = nullptr;
+    if (!check(t, "CreateSharedHandle", resource->CreateSharedHandle(nullptr,
+               DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)))
+        return result(t, false);
+    Ref<ID3D11Device> dev2;
+    Ref<ID3D11Device1> dev21;
+    Ref<ID3D11DeviceContext> ctx2;
+    Ref<ID3D11Texture2D> opened;
+    Ref<IDXGIKeyedMutex> consumer;
+    bool ok = check(t, "D3D11CreateDevice", D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                         0, nullptr, 0, D3D11_SDK_VERSION, dev2.put(), nullptr, ctx2.put())) &&
+              check(t, "ID3D11Device1", dev2->QueryInterface(IID_PPV_ARGS(dev21.put()))) &&
+              check(t, "OpenSharedResource1", dev21->OpenSharedResource1(handle, IID_PPV_ARGS(opened.put())));
+    CloseHandle(handle);
+    if (!ok || !check(t, "consumer mutex", opened->QueryInterface(IID_PPV_ARGS(consumer.put()))))
+        return result(t, false);
+    // AcquireSync can return WAIT_TIMEOUT, which is not a failed HRESULT.
+    if (producer->AcquireSync(0, 5000) != S_OK)
+        return result(t, false);
+    const float color[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+    ctx->ClearRenderTargetView(rtv, color);
+    std::vector<uint32_t> texels;
+    UINT width;
+    ctx->Flush();
+    const HRESULT release = producer->ReleaseSync(1);
+    if (!ok || !check(t, "ReleaseSync(producer)", release) || consumer->AcquireSync(1, 5000) != S_OK)
+        return result(t, false);
+    ok = read_back(dev2, ctx2, opened, &texels, &width) &&
+         expect_texel(t, texels, width, 95, 63, 0xff00ffff);
+    return result(t, check(t, "ReleaseSync(consumer)", consumer->ReleaseSync(2)) && ok);
 }
 
 void pump_messages()
@@ -627,9 +755,12 @@ int main(int argc, char** argv)
     AddVectoredExceptionHandler(1, report_crash);
     std::printf("d3d11probe built " __DATE__ " " __TIME__ "\n");
     bool present = false;
+    HANDLE child_handle = nullptr;
     for (int i = 1; i < argc; i++)
         if (!std::strcmp(argv[i], "--present"))
             present = true;
+        else if (!std::strcmp(argv[i], "--shared-child") && i + 1 < argc)
+            child_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(std::strtoull(argv[++i], nullptr, 10)));
 
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     g_compile = compiler ? reinterpret_cast<D3DCompileFn>(reinterpret_cast<void*>(GetProcAddress(compiler, "D3DCompile")))
@@ -666,13 +797,18 @@ int main(int argc, char** argv)
             failures++;
             continue;
         }
+        if (child_handle)
+            return result("shared child pixels", shared_child(dev, ctx, child_handle)) ? 0 : 1;
         for (auto test : {clear_test, triangle_test, textured_test, depth_test, compute_test, queries_test,
                           update_test})
             failures += !test(dev, ctx);
         failures += !shared_test(dev, ctx, adapter);
+        failures += !shared_nt_test(dev, ctx, adapter);
         if (present)
             failures += !present_test(dev, ctx, adapter);
     }
+    if (child_handle)
+        return 1;
     std::printf("%s\n", failures ? "Some tests FAILED" : "All passed!");
     return failures ? 1 : 0;
 }
