@@ -51,6 +51,42 @@ D3D11_TEXTURE2D_DESC1 surface_desc(DXGI_FORMAT format, UINT width, UINT height, 
     return {width, height, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0, 0, D3D11_TEXTURE_LAYOUT_UNDEFINED};
 }
 
+// Makes an allocation resident and waits for it. The memory is Venus's and always resident on the host, but dxgkrnl
+// blits legacy blt-model presents itself and fails one whose source it was not asked to keep resident ("Allocation
+// is not requested to be resident"), which removes the device.
+HRESULT make_resident(Device& d, D3DKMT_HANDLE allocation)
+{
+    const HANDLE dev = d.rt_device.handle;
+    if (!d.paging_queue) {
+        D3DDDICB_CREATEPAGINGQUEUE c{};
+        c.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
+        const HRESULT hr = d.kt.pfnCreatePagingQueueCb(dev, &c);
+        if (FAILED(hr)) {
+            VGD_WARN("shared surface: CreatePagingQueueCb failed: 0x%08lx", hr);
+            return hr;
+        }
+        d.paging_queue = c.hPagingQueue;
+        d.paging_fence = c.hSyncObject;
+    }
+    D3DDDI_MAKERESIDENT mr{};
+    mr.hPagingQueue = d.paging_queue;
+    mr.NumAllocations = 1;
+    mr.AllocationList = &allocation;
+    mr.Flags.CantTrimFurther = 1;
+    HRESULT hr = d.kt.pfnMakeResidentCb(dev, &mr);
+    if (hr == E_PENDING) {   // resident once the paging queue's fence reaches the value
+        UINT64 value = mr.PagingFenceValue;
+        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU w{};
+        w.ObjectCount = 1;
+        w.ObjectHandleArray = &d.paging_fence;
+        w.FenceValueArray = &value;
+        hr = d.kt.pfnWaitForSynchronizationObjectFromCpuCb(dev, &w);
+    }
+    if (FAILED(hr))
+        VGD_WARN("shared surface: MakeResidentCb(0x%x) failed: 0x%08lx", allocation, hr);
+    return hr;
+}
+
 HRESULT make_present_resident(Device& d, ResourceObject* r)
 {
     if (!d.explicit_residency || !r || !r->allocation || r->present_resident)
@@ -60,36 +96,13 @@ HRESULT make_present_resident(Device& d, ResourceObject* r)
         VGD_WARN("Present: explicit residency callbacks are unavailable");
         return E_NOTIMPL;
     }
-    if (!d.paging_queue) {
-        D3DDDICB_CREATEPAGINGQUEUE queue{};
-        queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
-        const HRESULT hr = d.kt.pfnCreatePagingQueueCb(d.rt_device.handle, &queue);
-        if (FAILED(hr))
-            return hr;
-        d.paging_queue = queue.hPagingQueue;
-        d.paging_fence = queue.hSyncObject;
+    const HRESULT hr = make_resident(d, r->allocation);
+    if (SUCCEEDED(hr)) {
+        // Hold one residency reference until this allocation is freed.
+        r->present_resident = true;
+        VGD_TRACE("Present: allocation 0x%x is resident", r->allocation);
     }
-    D3DDDI_MAKERESIDENT resident{};
-    resident.hPagingQueue = d.paging_queue;
-    resident.NumAllocations = 1;
-    resident.AllocationList = &r->allocation;
-    resident.Flags.CantTrimFurther = 1;
-    HRESULT hr = d.kt.pfnMakeResidentCb(d.rt_device.handle, &resident);
-    if (hr == E_PENDING) {
-        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait{};
-        wait.ObjectCount = 1;
-        wait.ObjectHandleArray = &d.paging_fence;
-        wait.FenceValueArray = &resident.PagingFenceValue;
-        hr = d.kt.pfnWaitForSynchronizationObjectFromCpuCb(d.rt_device.handle, &wait);
-    }
-    if (FAILED(hr)) {
-        VGD_WARN("Present: MakeResidentCb(0x%x) failed: 0x%08lx", r->allocation, hr);
-        return hr;
-    }
-    // MakeResident counts references. Hold one until this allocation is freed.
-    r->present_resident = true;
-    VGD_TRACE("Present: allocation 0x%x is resident", r->allocation);
-    return S_OK;
+    return hr;
 }
 
 } // namespace
