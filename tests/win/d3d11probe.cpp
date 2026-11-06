@@ -3,6 +3,7 @@
 // every test on it, printing PASS/FAIL per test. Shaders are compiled in the guest by d3dcompiler_47.dll.
 //   --present  also show swapchains in a window for a few seconds each (watch them): flip model, then the legacy
 //              blt model, then ResizeBuffers.
+//   --present-blt  run the legacy presentation phase without a prior flip swapchain.
 #include <windows.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -655,13 +656,100 @@ bool shared_nt_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* a
     ctx->ClearRenderTargetView(rtv, color);
     std::vector<uint32_t> texels;
     UINT width;
-    ctx->Flush();
     const HRESULT release = producer->ReleaseSync(1);
     if (!ok || !check(t, "ReleaseSync(producer)", release) || consumer->AcquireSync(1, 5000) != S_OK)
         return result(t, false);
     ok = read_back(dev2, ctx2, opened, &texels, &width) &&
          expect_texel(t, texels, width, 95, 63, 0xff00ffff);
     return result(t, check(t, "ReleaseSync(consumer)", consumer->ReleaseSync(2)) && ok);
+}
+
+// Keep both imports open while full updates and dirty rectangles cross the mutex.
+// Odd dimensions expose row-pitch errors. Every pixel is checked on every frame.
+bool shared_updates_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter)
+{
+    const char* t = "shared NT updates";
+    constexpr UINT w = 257, h = 131, frames = 16;
+    D3D11_TEXTURE2D_DESC desc{w, h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0,
+                              D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX};
+    Ref<ID3D11Texture2D> tex, opened;
+    Ref<IDXGIResource1> resource;
+    Ref<IDXGIKeyedMutex> producer, consumer;
+    Ref<ID3D11Device> dev2;
+    Ref<ID3D11Device1> dev21;
+    Ref<ID3D11DeviceContext> ctx2;
+    Ref<ID3D11DeviceContext1> ctx1, ctx21;
+    Ref<ID3D11RenderTargetView> rtv, rtv2;
+    if (!check(t, "CreateTexture2D", dev->CreateTexture2D(&desc, nullptr, tex.put())) ||
+        !check(t, "producer resource", tex->QueryInterface(IID_PPV_ARGS(resource.put()))) ||
+        !check(t, "producer mutex", tex->QueryInterface(IID_PPV_ARGS(producer.put()))) ||
+        !check(t, "producer context", ctx->QueryInterface(IID_PPV_ARGS(ctx1.put()))) ||
+        !check(t, "producer RTV", dev->CreateRenderTargetView(tex, nullptr, rtv.put())) ||
+        !check(t, "second device", D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                   0, nullptr, 0, D3D11_SDK_VERSION, dev2.put(), nullptr, ctx2.put())) ||
+        !check(t, "second device1", dev2->QueryInterface(IID_PPV_ARGS(dev21.put()))) ||
+        !check(t, "consumer context", ctx2->QueryInterface(IID_PPV_ARGS(ctx21.put()))))
+        return result(t, false);
+    HANDLE handle = nullptr;
+    if (!check(t, "CreateSharedHandle", resource->CreateSharedHandle(nullptr,
+               DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)))
+        return result(t, false);
+    const HRESULT hr = dev21->OpenSharedResource1(handle, IID_PPV_ARGS(opened.put()));
+    CloseHandle(handle);
+    if (!check(t, "OpenSharedResource1", hr) ||
+        !check(t, "consumer mutex", opened->QueryInterface(IID_PPV_ARGS(consumer.put()))) ||
+        !check(t, "consumer RTV", dev2->CreateRenderTargetView(opened, nullptr, rtv2.put())))
+        return result(t, false);
+    std::vector<uint32_t> expected(w * h), actual;
+    auto pixels_match = [&](ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* image,
+                            UINT frame, const char* direction) {
+        UINT width = 0;
+        if (!read_back(device, context, image, &actual, &width) || width != w || actual.size() != expected.size())
+            return false;
+        for (UINT y = 0; y < h; y++)
+            for (UINT x = 0; x < w; x++)
+                if (actual[y * w + x] != expected[y * w + x]) {
+                    std::printf("    %s frame %u %s: ", t, frame, direction);
+                    expect_texel(t, actual, w, x, y, expected[y * w + x]);
+                    return false;
+                }
+        return true;
+    };
+    for (UINT frame = 0; frame < frames; frame++) {
+        if (producer->AcquireSync(2 * frame, 5000) != S_OK)
+            return result(t, false);
+        for (UINT y = 0; y < h; y++)
+            for (UINT x = 0; x < w; x++)
+                expected[y * w + x] = 0xff000000u | ((x + frame * 17) & 255) |
+                    (((y * 3 + frame * 11) & 255) << 8) | (((x ^ y ^ (frame * 23)) & 255) << 16);
+        ctx->UpdateSubresource(tex, 0, nullptr, expected.data(), w * 4, 0);
+        const D3D11_RECT dirty{LONG(frame * 7), 19, LONG(frame * 7 + 67), 83};
+        const float cyan[] = {0, 1, 1, 1};
+        ctx1->ClearView(rtv, cyan, &dirty, 1);
+        for (LONG y = dirty.top; y < dirty.bottom; y++)
+            for (LONG x = dirty.left; x < dirty.right; x++)
+                expected[y * w + x] = 0xff00ffff;
+        // ReleaseSync must submit the producer's commands without an explicit Flush.
+        if (!check(t, "producer ReleaseSync", producer->ReleaseSync(2 * frame + 1)) ||
+            consumer->AcquireSync(2 * frame + 1, 5000) != S_OK)
+            return result(t, false);
+        const bool forward = pixels_match(dev2, ctx2, opened, frame, "producer to consumer");
+        const D3D11_RECT reply{193, 97, 251, 129};
+        const float yellow[] = {1, 1, 0, 1};
+        ctx21->ClearView(rtv2, yellow, &reply, 1);
+        for (LONG y = reply.top; y < reply.bottom; y++)
+            for (LONG x = reply.left; x < reply.right; x++)
+                expected[y * w + x] = 0xffffff00;
+        if (!check(t, "consumer ReleaseSync", consumer->ReleaseSync(2 * frame + 2)) || !forward ||
+            producer->AcquireSync(2 * frame + 2, 5000) != S_OK)
+            return result(t, false);
+        const bool reverse = pixels_match(dev, ctx, tex, frame, "consumer to producer");
+        if (!check(t, "producer return key", producer->ReleaseSync(2 * frame + 2)) || !reverse)
+            return result(t, false);
+    }
+    std::printf("    %u frames, %ux%u, full updates and bidirectional dirty rectangles\n", frames, w, h);
+    return result(t, true);
 }
 
 void pump_messages()
@@ -675,7 +763,7 @@ void pump_messages()
 
 // Swapchains in a window (watch them): flip model, the legacy blt model, then flip model again after
 // ResizeBuffers. Each phase cycles colours for about two seconds.
-bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter)
+bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* adapter, bool blt_only)
 {
     const char* t = "present";
     Ref<IDXGIFactory2> factory;
@@ -698,6 +786,8 @@ bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* ada
                             {"flip sequential, ResizeBuffers 640x360", DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2, 320, 180}};
     bool ok = true;
     for (const Phase& p : phases) {
+        if (blt_only && p.effect != DXGI_SWAP_EFFECT_DISCARD)
+            continue;
         DXGI_SWAP_CHAIN_DESC1 sd{};
         sd.Width = p.width;
         sd.Height = p.height;
@@ -732,6 +822,7 @@ bool present_test(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIAdapter* ada
             hr = sc->Present(1, 0);
             if (FAILED(hr)) {
                 std::printf("    %s: %s: Present failed at frame %u: 0x%08lx\n", t, p.name, frame, hr);
+                std::printf("    GetDeviceRemovedReason: 0x%08lx\n", dev->GetDeviceRemovedReason());
                 break;
             }
             presented++;
@@ -755,10 +846,13 @@ int main(int argc, char** argv)
     AddVectoredExceptionHandler(1, report_crash);
     std::printf("d3d11probe built " __DATE__ " " __TIME__ "\n");
     bool present = false;
+    bool blt_only = false;
     HANDLE child_handle = nullptr;
     for (int i = 1; i < argc; i++)
         if (!std::strcmp(argv[i], "--present"))
             present = true;
+        else if (!std::strcmp(argv[i], "--present-blt"))
+            present = blt_only = true;
         else if (!std::strcmp(argv[i], "--shared-child") && i + 1 < argc)
             child_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(std::strtoull(argv[++i], nullptr, 10)));
 
@@ -804,8 +898,9 @@ int main(int argc, char** argv)
             failures += !test(dev, ctx);
         failures += !shared_test(dev, ctx, adapter);
         failures += !shared_nt_test(dev, ctx, adapter);
+        failures += !shared_updates_test(dev, ctx, adapter);
         if (present)
-            failures += !present_test(dev, ctx, adapter);
+            failures += !present_test(dev, ctx, adapter, blt_only);
     }
     if (child_handle)
         return 1;

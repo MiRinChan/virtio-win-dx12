@@ -472,7 +472,20 @@ HRESULT APIENTRY query_resource_residency(DXGI_DDI_ARG_QUERYRESOURCERESIDENCY* a
     return S_OK;
 }
 
-HRESULT APIENTRY resolve_shared_resource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE*) { return S_OK; }
+HRESULT APIENTRY resolve_shared_resource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE* a)
+{
+    Device& d = *Device::from(a->hDevice);
+    ResourceObject* r = ResourceObject::from(a->hResource);
+    // ReleaseSync and GetDC reach this boundary without an application Flush.
+    // The runtime's context cannot order work submitted on DXVK's own device.
+    if (r->image) {
+        const HRESULT hr = dxvk::flush_shared_clears(d.d3d.get(), r->resource.get());
+        if (FAILED(hr))
+            return hr;
+    }
+    VGD_TRACE("ResolveSharedResource: allocation 0x%x: complete rendering before handoff", r->allocation);
+    return d.wait_idle();
+}
 
 // Nothing is ever discarded: offered resources keep their memory.
 HRESULT APIENTRY offer_resources(DXGI_DDI_ARG_OFFERRESOURCES*) { return S_OK; }
