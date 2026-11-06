@@ -51,7 +51,7 @@ It also requires a final fence to complete within five seconds after the CPU sig
 
 On the test VM, the stable ICD returned all submissions immediately and passed.
 The original accounting experiment took 2,407 ms, needed the watchdog, and failed.
-The worker experiment passed this single-device test. Its separate device-destruction failure remains unresolved.
+The worker experiment passed this single-device test. Its separate WDDM destruction wait remains unresolved.
 This mode does not replace the desktop and multi-device checks.
 
 ## Live result on 2026-11-06
@@ -109,10 +109,25 @@ A queue worker alone does not make that scheduling path safe.
 The paced two-device test also exposed a completion failure on the stable ICD after the idle device was destroyed.
 The stable test returned from that destruction immediately, but its final fence timed out after the CPU signal.
 The worker experiment completed the fence but delayed destruction by about 1.38 seconds.
-This test needs further diagnosis before it can serve as an end-to-end regression gate.
+A native comparison later isolated this stable-ICD failure to blocking native device destruction on the primary protocol ring.
+The separate destruction-ring candidate passes the stable two-device regression in isolated processes.
+See [Venus device destruction and CPU progress](venus-device-progress.md).
+That candidate does not repair the accounting worker's WDDM wait.
 
 Both accounting experiments remain outside the build patch list.
 The installed package retains the stable ICD.
+
+## Task Manager performance page on 2026-11-07
+
+The actual Performance page reports zero GPU use at idle and nonzero use during D3D11 presentation.
+During the repeated presentation test, the displayed 3D engine and total GPU use reached 41%.
+All 360 presents and the default D3D11 tests passed. This run did not compare screen pixels.
+The installed package and its configuration stayed unchanged.
+
+The direct Vulkan load still left both displayed engines and total GPU use at zero.
+That process completed 204 submissions, checked every buffer word, and exited with code zero.
+Its GPU timestamp intervals covered 93.31% of the ten-second load.
+This establishes a workload-specific accounting gap. An idle reading of zero alone does not establish a fault.
 
 ## Next work
 

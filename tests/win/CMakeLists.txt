@@ -12,6 +12,10 @@ add_executable(vkqueueprobe vkqueueprobe.cpp)
 target_link_libraries(vkqueueprobe PRIVATE vgd-vulkan-headers)
 target_link_options(vkqueueprobe PRIVATE -static -static-libgcc -static-libstdc++)
 
+add_executable(vkdeviceprobe vkdeviceprobe.cpp)
+target_link_libraries(vkdeviceprobe PRIVATE vgd-vulkan-headers)
+target_link_options(vkdeviceprobe PRIVATE -static -static-libgcc -static-libstdc++)
+
 add_executable(d3d11probe d3d11probe.cpp)
 target_link_libraries(d3d11probe PRIVATE d3d11 dxgi dxguid user32 gdi32 dwmapi)
 target_link_options(d3d11probe PRIVATE -static -static-libgcc -static-libstdc++)
