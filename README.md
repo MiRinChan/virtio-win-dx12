@@ -36,8 +36,15 @@ The virtio-gpu device needs `venus`, `blob` and a `hostmem` window:
 -machine q35,memory-backend=mem
 -object memory-backend-memfd,id=mem,size=8G,share=on
 -device virtio-vga-gl,venus=on,blob=on,hostmem=4G
+-accel kvm,honor-guest-pat=on  # needed on Intel hosts with a discrete GPU
 -display gtk,gl=on            # or SPICE with gl=on
 ```
+
+On Intel hosts with a discrete GPU, KVM must honor the guest's page attribute table (PAT). This keeps the guest
+CPU mappings consistent with the host's cache attributes. Use Linux 6.16 or later and QEMU 11.0 or later with the
+`honor-guest-pat` option, as described in [Mesa's Venus requirements](https://docs.mesa3d.org/drivers/venus.html).
+Add `honor-guest-pat=on` to the existing `-accel kvm` argument. Without it, CPU uploads can contain stale data,
+which can cause corrupted desktop surfaces and cursors even when Vulkan device creation succeeds.
 
 With libvirt, which has no attribute for `venus`, set it through an override on the video device:
 
@@ -72,6 +79,9 @@ With libvirt, which has no attribute for `venus`, set it through an override on 
   </qemu:device>
 </qemu:override>
 ```
+
+For a complete virt-manager setup, including a persistent guest PAT option and Virtio tablet input,
+see [virt-manager and SPICE](docs/virt-manager.md).
 
 For lower input latency, we recommend virtio input devices in place of the emulated PS/2 and USB ones (the guest
 needs virtio-win's `vioinput` driver). If convenient, also avoid virt-manager and spice display, in favor of QEMU GTK window.
