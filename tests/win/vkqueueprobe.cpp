@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Load a specified ICD directly and compare WDDM counters during idle and GPU work.
-// Usage: vkqueueprobe <absolute ICD DLL path> [load seconds, 1..120]
+// Usage: vkqueueprobe <absolute ICD DLL path> [load seconds, 1..120 | --pending-wait]
 // Each submission fills 32 MiB sixteen times. Fences and a full readback check completion.
 #include <windows.h>
 #include <vulkan/vulkan.h>
@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #define REQUIRE(call)                                                                                        \
@@ -22,11 +25,12 @@ int main(int argc, char **argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2 || argc > 3) {
-        std::printf("Usage: vkqueueprobe <absolute ICD DLL path> [load seconds, 1..120]\n");
+        std::printf("Usage: vkqueueprobe <absolute ICD DLL path> [load seconds, 1..120 | --pending-wait]\n");
         return 2;
     }
     char *end = nullptr;
-    const unsigned long seconds = argc == 3 ? std::strtoul(argv[2], &end, 10) : 10;
+    const bool pending_wait = argc == 3 && std::strcmp(argv[2], "--pending-wait") == 0;
+    const unsigned long seconds = argc == 3 && !pending_wait ? std::strtoul(argv[2], &end, 10) : 10;
     if (seconds < 1 || seconds > 120 || (end && (*end || end == argv[2]))) {
         std::printf("Load duration must be 1..120 seconds\n");
         return 2;
@@ -51,7 +55,7 @@ int main(int argc, char **argv)
     auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "vkqueueprobe";
-    app.apiVersion = VK_API_VERSION_1_1;
+    app.apiVersion = pending_wait ? VK_API_VERSION_1_2 : VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     VkInstance instance;
@@ -61,6 +65,7 @@ int main(int argc, char **argv)
     IFN(vkGetPhysicalDeviceProperties);
     IFN(vkGetPhysicalDeviceMemoryProperties);
     IFN(vkGetPhysicalDeviceQueueFamilyProperties);
+    IFN(vkGetPhysicalDeviceFeatures2);
     IFN(vkCreateDevice);
     IFN(vkGetDeviceProcAddr);
     IFN(vkDestroyInstance);
@@ -98,6 +103,17 @@ int main(int argc, char **argv)
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    if (pending_wait) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features.pNext = &timeline;
+        vkGetPhysicalDeviceFeatures2(gpu, &features);
+        if (!timeline.timelineSemaphore) {
+            std::printf("Timeline semaphores unavailable\n");
+            return 1;
+        }
+        dci.pNext = &timeline;
+    }
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     VkDevice device;
@@ -134,6 +150,72 @@ int main(int argc, char **argv)
     DFN(vkGetQueryPoolResults);
     VkQueue queue;
     vkGetDeviceQueue(device, family, 0, &queue);
+    if (pending_wait) {
+        DFN(vkCreateSemaphore);
+        DFN(vkDestroySemaphore);
+        DFN(vkSignalSemaphore);
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        sci.pNext = &type;
+        VkSemaphore semaphore;
+        REQUIRE(vkCreateSemaphore(device, &sci, nullptr, &semaphore));
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence fence;
+        REQUIRE(vkCreateFence(device, &fci, nullptr, &fence));
+        std::atomic<bool> submissions_done{false};
+        bool watchdog = false;
+        VkResult signal_result = VK_NOT_READY;
+        std::thread signaler([&] {
+            for (unsigned i = 0; i < 200 && !submissions_done; i++)
+                Sleep(10);
+            watchdog = !submissions_done;
+            VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+            signal.semaphore = semaphore;
+            signal.value = 1;
+            signal_result = vkSignalSemaphore(device, &signal);
+        });
+        const auto start = GetTickCount64();
+        VkResult submit_result = VK_SUCCESS;
+        unsigned submitted = 0;
+        for (unsigned i = 0; i < 128; i++) {
+            const uint64_t value = 1;
+            VkTimelineSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            wait.waitSemaphoreValueCount = 1;
+            wait.pWaitSemaphoreValues = &value;
+            const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.pNext = &wait;
+            submit.waitSemaphoreCount = 1;
+            submit.pWaitSemaphores = &semaphore;
+            submit.pWaitDstStageMask = &stage;
+            submit_result = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+            if (submit_result != VK_SUCCESS)
+                break;
+            submitted++;
+        }
+        const auto elapsed = GetTickCount64() - start;
+        submissions_done = true;
+        signaler.join();
+        std::printf("%u pending submissions: %llu ms, watchdog %u, submit %d, CPU signal %d\n",
+                    submitted, (unsigned long long)elapsed, watchdog ? 1u : 0u, submit_result, signal_result);
+        if (submit_result != VK_SUCCESS || signal_result != VK_SUCCESS)
+            return 1;
+        REQUIRE(vkQueueSubmit(queue, 0, nullptr, fence));
+        REQUIRE(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull));
+        REQUIRE(vkDeviceWaitIdle(device));
+        vkDestroyFence(device, fence, nullptr);
+        vkDestroySemaphore(device, semaphore, nullptr);
+        vkDestroyDevice(device, nullptr);
+        vkDestroyInstance(instance, nullptr);
+        FreeLibrary(module);
+        if (watchdog || elapsed >= 1000) {
+            std::printf("FAIL pending waits blocked CPU submission\n");
+            return 1;
+        }
+        std::printf("PASS pending waits preserved CPU progress and completed after the CPU signal\n");
+        return 0;
+    }
     constexpr VkDeviceSize size = 32u * 1024u * 1024u;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;

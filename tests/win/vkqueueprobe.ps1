@@ -46,6 +46,7 @@ $p.Refresh()
 @{
     Icd = $icdPath
     Hash = (Get-FileHash $icdPath -Algorithm SHA256).Hash
+    Environment = @{ VN_PERF = $env:VN_PERF; VN_DEBUG = $env:VN_DEBUG }
     Pid = $p.Id
     Exit = $p.ExitCode
     Timeout = $timeout

@@ -1,6 +1,6 @@
 # GPU timing diagnosis
 
-Task Manager still reports zero GPU use during verified GPU work.
+Task Manager still reports zero GPU use during the verified direct Vulkan load.
 The probe added here measures completion, device timestamps, and Windows counters without replacing the installed driver.
 It does not repair the missing timing.
 
@@ -20,7 +20,7 @@ Run this command in the logged-in user's desktop session:
 ```
 
 The script creates a new local output directory and prints its path.
-Its `result.json` records the selected module, SHA-256 hash, process ID, exit code, timeout, and counter samples.
+Its `result.json` records the selected module, SHA-256 hash, process ID, exit code, timeout, environment flags, and counter samples.
 Use the recorded process ID to attribute the counters.
 An exit code of zero means the GPU commands and readback passed. It does not mean the counters work.
 
@@ -33,6 +33,26 @@ It keeps four seconds of idle before and after the load.
 When the queue supports timestamps, the probe records two timestamps around each command buffer.
 It reports the sum of those intervals and the load's wall time.
 Their ratio describes this workload. It is not a general GPU utilization metric.
+
+## Check a future signal
+
+Run the same executable directly to check CPU progress with pending timeline waits:
+
+```powershell
+.\vkqueueprobe.exe 'C:\path\to\vgd_vulkan_virtio.dll' --pending-wait
+$LASTEXITCODE
+```
+
+This mode requires Vulkan 1.2 timeline semaphores.
+It submits 128 waits for value one, then signals that value from the CPU.
+A watchdog signals after about two seconds if the submission loop cannot finish.
+The test fails if it needs the watchdog or takes at least one second to submit the waits.
+It also requires a final fence to complete within five seconds after the CPU signal.
+
+On the test VM, the stable ICD returned all submissions immediately and passed.
+The original accounting experiment took 2,407 ms, needed the watchdog, and failed.
+The worker experiment passed this single-device test. Its separate device-destruction failure remains unresolved.
+This mode does not replace the desktop and multi-device checks.
 
 ## Live result on 2026-11-06
 
@@ -51,9 +71,23 @@ A separate run without timestamps completed 222 submissions and also passed its 
 Its Windows formatted counters remained zero. The raw execution counter also remained constant during the load.
 These results establish actual GPU work alongside missing Windows timing.
 
+## D3D11 presentation comparison
+
+The stable ICD also passed two isolated D3D11 presentation runs.
+One retained `VGD_PRESENT_GPU_WAIT=0`. The other set it to `1` only in the test process.
+Each run passed the default D3D11 tests, all 360 presents, and six screen comparisons against GDI references.
+The process counters reached 44% with the existing setting and 61% with the GPU fence enabled.
+Driver logs confirmed that the second run opened and used the GPU fence.
+
+These presentation counters include scheduled presentation work.
+They do not establish timing for arbitrary Vulkan rendering or compute.
+The system setting remains unchanged. A per-process probe does not establish cold desktop safety for that setting.
+
 ## Submission path
 
 Vulkan protocol traffic uses `D3DKMTEscape`, outside the normal scheduled DMA path.
+The current Windows configuration also has `VGD_PRESENT_GPU_WAIT=0`, which disables D3D11's GPU fence path at presentation.
+The direct Vulkan load does not present, so it does not depend on that setting.
 The kernel driver also supports scheduled timeline packets that wait for a host queue to complete.
 For the normal WDDM path, Windows sends DMA buffers through its scheduler before the kernel driver submits them.
 See [WDDM operation flow](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/windows-vista-and-later-display-driver-model-operation-flow).
