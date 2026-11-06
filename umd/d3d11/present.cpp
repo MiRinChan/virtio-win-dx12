@@ -17,11 +17,13 @@ namespace {
 // The texture of a shared surface and the image under it: DXVK's image description for the texture, on memory that
 // is exported (*fd set) or imported (fd given).
 HRESULT surface_texture(Device& d, const D3D11_TEXTURE2D_DESC1& desc, int import_fd, uint64_t import_size,
-                        ResourceObject& out, int* export_fd)
+                        ResourceObject& out, int* export_fd, bool cpu_blt = false)
 {
     LinearImageDesc ld;
     ld.width = desc.Width;
     ld.height = desc.Height;
+    if (cpu_blt)
+        ld.required_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     HRESULT hr = dxvk::image_info(d.d3d.get(), desc, &ld.format, &ld.view_formats, &ld.usage);
     if (FAILED(hr))
         return hr;
@@ -36,7 +38,7 @@ HRESULT surface_texture(Device& d, const D3D11_TEXTURE2D_DESC1& desc, int import
     if (FAILED(hr))
         return hr;
     Com<ID3D11Texture2D> tex;
-    hr = dxvk::texture_from_image(d.d3d.get(), desc, out.image->image(), tex.put());
+    hr = dxvk::texture_from_image(d.d3d.get(), desc, out.image->image(), !export_fd, tex.put());
     if (FAILED(hr)) {
         VGD_WARN("shared surface: DXVK did not take the image: 0x%08lx", hr);
         return hr;
@@ -82,7 +84,10 @@ HRESULT create_shared_surface(Device& d, const D3D11DDIARG_CREATERESOURCE& a, D3
     const UINT bind = api_bind_flags(a.BindFlags) | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     const D3D11_TEXTURE2D_DESC1 desc = surface_desc(a.Format, width, height, bind);
     int fd = -1;
-    HRESULT hr = surface_texture(d, desc, -1, 0, out, &fd);
+    // Legacy windowed presents copy into a standard allocation on the CPU.
+    const bool cpu_blt = (a.BindFlags & D3D10_DDI_BIND_PRESENT) && !a.pPrimaryDesc &&
+                         !(a.MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED);
+    HRESULT hr = surface_texture(d, desc, -1, 0, out, &fd, cpu_blt);
     if (FAILED(hr)) {
         VGD_WARN("shared surface: %ux%u format %d failed: 0x%08lx", width, height, a.Format, hr);
         return hr;
@@ -154,7 +159,7 @@ HRESULT open_shared_surface(Device& d, const D3D10DDIARG_OPENRESOURCE& a, Resour
         VGD_WARN("OpenResource: only surfaces of known formats can be opened");
         return E_NOTIMPL;
     }
-    const int fd = import_fd("OpenResource", d.kernel(), a.hKMResource.handle);
+    const int fd = import_fd("OpenResource", d.kernel(), alloc->hAllocation, *e);
     if (fd < 0)
         return E_FAIL;
     out.dimension = D3D10DDIRESOURCE_TEXTURE2D;
@@ -162,6 +167,11 @@ HRESULT open_shared_surface(Device& d, const D3D10DDIARG_OPENRESOURCE& a, Resour
     out.width = width;
     out.height = height;
     HRESULT hr = surface_texture(d, surface_desc(format, width, height, bind), fd, e->Size, out, nullptr);
+    if (SUCCEEDED(hr)) {
+        // Opened resources also need DeallocateCb when their runtime view dies.
+        out.allocation = alloc->hAllocation;
+        out.allocated = true;
+    }
     if (FAILED(hr))
         VGD_WARN("OpenResource: import of %ux%u format %d failed: 0x%08lx", width, height, format, hr);
     return hr;
@@ -307,6 +317,47 @@ namespace {
 
 // --- Present -------------------------------------------------------------------------------------------------
 
+HRESULT make_present_resident(Device& d, ResourceObject* r)
+{
+    if (!d.explicit_residency || !r || !r->allocation || r->present_resident)
+        return S_OK;
+    if (!d.kt.pfnCreatePagingQueueCb || !d.kt.pfnDestroyPagingQueueCb ||
+        !d.kt.pfnMakeResidentCb || !d.kt.pfnWaitForSynchronizationObjectFromCpuCb) {
+        VGD_WARN("Present: explicit residency callbacks are unavailable");
+        return E_NOTIMPL;
+    }
+    if (!d.paging_queue) {
+        D3DDDICB_CREATEPAGINGQUEUE queue{};
+        queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
+        const HRESULT hr = d.kt.pfnCreatePagingQueueCb(d.rt_device.handle, &queue);
+        if (FAILED(hr))
+            return hr;
+        d.paging_queue = queue.hPagingQueue;
+        d.paging_fence = queue.hSyncObject;
+    }
+    D3DDDI_MAKERESIDENT resident{};
+    resident.hPagingQueue = d.paging_queue;
+    resident.NumAllocations = 1;
+    resident.AllocationList = &r->allocation;
+    resident.Flags.CantTrimFurther = 1;
+    HRESULT hr = d.kt.pfnMakeResidentCb(d.rt_device.handle, &resident);
+    if (hr == E_PENDING) {
+        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait{};
+        wait.ObjectCount = 1;
+        wait.ObjectHandleArray = &d.paging_fence;
+        wait.FenceValueArray = &resident.PagingFenceValue;
+        hr = d.kt.pfnWaitForSynchronizationObjectFromCpuCb(d.rt_device.handle, &wait);
+    }
+    if (FAILED(hr)) {
+        VGD_WARN("Present: MakeResidentCb(0x%x) failed: 0x%08lx", r->allocation, hr);
+        return hr;
+    }
+    // MakeResident counts references. Hold one until this allocation is freed.
+    r->present_resident = true;
+    VGD_TRACE("Present: allocation 0x%x is resident", r->allocation);
+    return S_OK;
+}
+
 HRESULT present_allocations(Device& d, D3DKMT_HANDLE src, D3DKMT_HANDLE dst, void* dxgi_context)
 {
     if (!d.present_context) {
@@ -355,7 +406,16 @@ HRESULT APIENTRY present(DXGI_DDI_ARG_PRESENT* a)
     // Also before: a present that blocks (on our rendering or in the KMD) never reaches the line below.
     if (n < 8 || verbose())
         VGD_TRACE("Present #%u: src 0x%x, dst 0x%x: begin", n, src, dst);
-    HRESULT hr = present_allocations(d, src, dst, a->pDXGIContext);
+    HRESULT hr = make_present_resident(d, ResourceObject::from(a->hSurfaceToPresent));
+    if (SUCCEEDED(hr) && a->hDstResource)
+        hr = make_present_resident(d, ResourceObject::from(a->hDstResource));
+    if (SUCCEEDED(hr)) {
+        ResourceObject* surface = ResourceObject::from(a->hSurfaceToPresent);
+        if (surface->image)
+            hr = dxvk::flush_shared_clears(d.d3d.get(), surface->resource.get());
+    }
+    if (SUCCEEDED(hr))
+        hr = present_allocations(d, src, dst, a->pDXGIContext);
     if (n < 8 || FAILED(hr) || verbose())
         VGD_TRACE("Present #%u: src 0x%x (sub %u), dst 0x%x (sub %u), flags 0x%x, interval %d -> 0x%08lx", n, src,
                   a->SrcSubResourceIndex, dst, a->DstSubResourceIndex, a->Flags.Value,
@@ -411,14 +471,17 @@ HRESULT APIENTRY rotate_resource_identities(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTIT
     Com<ID3D11Resource> first_resource = std::move(r[0]->resource);
     std::unique_ptr<LinearImage> first_image = std::move(r[0]->image);
     const D3DKMT_HANDLE first_allocation = r[0]->allocation;
+    const bool first_resident = r[0]->present_resident;
     for (UINT i = 0; i + 1 < n; i++) {
         r[i]->resource = std::move(r[i + 1]->resource);
         r[i]->image = std::move(r[i + 1]->image);
         r[i]->allocation = r[i + 1]->allocation;
+        r[i]->present_resident = r[i + 1]->present_resident;
     }
     r[n - 1]->resource = std::move(first_resource);
     r[n - 1]->image = std::move(first_image);
     r[n - 1]->allocation = first_allocation;
+    r[n - 1]->present_resident = first_resident;
     // Views are made again over the new storage; bound render targets are rebound.
     bool rebind = false;
     for (ResourceObject* res : r)
@@ -467,7 +530,20 @@ HRESULT APIENTRY query_resource_residency(DXGI_DDI_ARG_QUERYRESOURCERESIDENCY* a
     return S_OK;
 }
 
-HRESULT APIENTRY resolve_shared_resource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE*) { return S_OK; }
+HRESULT APIENTRY resolve_shared_resource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE* a)
+{
+    Device& d = *Device::from(a->hDevice);
+    ResourceObject* r = ResourceObject::from(a->hResource);
+    // ReleaseSync and GetDC reach this boundary without an application Flush.
+    // The runtime's context cannot order work submitted on DXVK's own device.
+    if (r->image) {
+        const HRESULT hr = dxvk::flush_shared_clears(d.d3d.get(), r->resource.get());
+        if (FAILED(hr))
+            return hr;
+    }
+    VGD_TRACE("ResolveSharedResource: allocation 0x%x: complete rendering before handoff", r->allocation);
+    return d.wait_idle();
+}
 
 // Nothing is ever discarded: offered resources keep their memory.
 HRESULT APIENTRY offer_resources(DXGI_DDI_ARG_OFFERRESOURCES*) { return S_OK; }

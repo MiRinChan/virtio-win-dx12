@@ -21,13 +21,15 @@ struct LinearImage::Plan {
 
 namespace {
 
-uint32_t memory_type(const VulkanDevice& d, uint32_t bits)
+uint32_t memory_type(const VulkanDevice& d, uint32_t bits, VkMemoryPropertyFlags required = 0)
 {
     VkPhysicalDeviceMemoryProperties props;
     d.vk.vkGetPhysicalDeviceMemoryProperties(d.physical, &props);
     uint32_t fallback = UINT32_MAX;
     for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
         if (!(bits & (1u << i)))
+            continue;
+        if ((props.memoryTypes[i].propertyFlags & required) != required)
             continue;
         if (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
             return i;
@@ -195,7 +197,7 @@ HRESULT LinearImage::create_exported(const VulkanDevice& d, const LinearImageDes
     export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &export_info};
     mai.allocationSize = req.memoryRequirements.size;
-    mai.memoryTypeIndex = memory_type(d, req.memoryRequirements.memoryTypeBits);
+    mai.memoryTypeIndex = memory_type(d, req.memoryRequirements.memoryTypeBits, desc.required_memory);
     if (mai.memoryTypeIndex == UINT32_MAX || d.vk.vkAllocateMemory(d.device, &mai, nullptr, &s->memory_) != VK_SUCCESS)
         return E_OUTOFMEMORY;
     s->size_ = req.memoryRequirements.size;

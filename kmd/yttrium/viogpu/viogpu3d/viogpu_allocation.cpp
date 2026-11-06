@@ -477,6 +477,10 @@ NTSTATUS VioGpuAllocation::MapForCpuCopy(ULONG ctx_id,
 {
     PAGED_CODE();
 
+    // The original allocation owns the blob's shared-memory range and mapping.
+    if (m_alias_source)
+        return m_alias_source->MapForCpuCopy(ctx_id, map_va, map_size, io_mapping);
+
     if (!map_va || !map_size || !io_mapping)
     {
         return STATUS_INVALID_PARAMETER;
@@ -571,6 +575,11 @@ void VioGpuAllocation::UnmapForCpuCopy(PVOID map_va,
                                        ULONGLONG map_size,
                                        BOOLEAN io_mapping)
 {
+    if (m_alias_source)
+    {
+        m_alias_source->UnmapForCpuCopy(map_va, map_size, io_mapping);
+        return;
+    }
     if (io_mapping && map_va && map_size)
     {
         MmUnmapIoSpace(map_va, (SIZE_T)map_size);
