@@ -23,8 +23,9 @@ struct LinearImageDesc {
     // Further formats views of it may use (the image is then mutable).
     std::vector<VkFormat> view_formats;
     VkImageUsageFlags usage = 0;
-    VkMemoryPropertyFlags required_memory = 0;
     uint32_t width = 0, height = 0;
+    // On memory the CPU can map (created exported only): the KMD copies legacy blt presents from it.
+    bool host_visible = false;
 };
 
 class LinearImage {

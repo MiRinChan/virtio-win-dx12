@@ -15,15 +15,14 @@ namespace vgd::umd {
 namespace {
 
 // The texture of a shared surface and the image under it: DXVK's image description for the texture, on memory that
-// is exported (*fd set) or imported (fd given).
+// is exported (*fd set; host-visible if asked) or imported (fd given).
 HRESULT surface_texture(Device& d, const D3D11_TEXTURE2D_DESC1& desc, int import_fd, uint64_t import_size,
-                        ResourceObject& out, int* export_fd, bool cpu_blt = false)
+                        ResourceObject& out, int* export_fd, bool host_visible = false)
 {
     LinearImageDesc ld;
     ld.width = desc.Width;
     ld.height = desc.Height;
-    if (cpu_blt)
-        ld.required_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    ld.host_visible = host_visible;
     HRESULT hr = dxvk::image_info(d.d3d.get(), desc, &ld.format, &ld.view_formats, &ld.usage);
     if (FAILED(hr))
         return hr;
@@ -50,6 +49,47 @@ HRESULT surface_texture(Device& d, const D3D11_TEXTURE2D_DESC1& desc, int import
 D3D11_TEXTURE2D_DESC1 surface_desc(DXGI_FORMAT format, UINT width, UINT height, UINT bind)
 {
     return {width, height, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0, 0, D3D11_TEXTURE_LAYOUT_UNDEFINED};
+}
+
+HRESULT make_present_resident(Device& d, ResourceObject* r)
+{
+    if (!d.explicit_residency || !r || !r->allocation || r->present_resident)
+        return S_OK;
+    if (!d.kt.pfnCreatePagingQueueCb || !d.kt.pfnDestroyPagingQueueCb ||
+        !d.kt.pfnMakeResidentCb || !d.kt.pfnWaitForSynchronizationObjectFromCpuCb) {
+        VGD_WARN("Present: explicit residency callbacks are unavailable");
+        return E_NOTIMPL;
+    }
+    if (!d.paging_queue) {
+        D3DDDICB_CREATEPAGINGQUEUE queue{};
+        queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
+        const HRESULT hr = d.kt.pfnCreatePagingQueueCb(d.rt_device.handle, &queue);
+        if (FAILED(hr))
+            return hr;
+        d.paging_queue = queue.hPagingQueue;
+        d.paging_fence = queue.hSyncObject;
+    }
+    D3DDDI_MAKERESIDENT resident{};
+    resident.hPagingQueue = d.paging_queue;
+    resident.NumAllocations = 1;
+    resident.AllocationList = &r->allocation;
+    resident.Flags.CantTrimFurther = 1;
+    HRESULT hr = d.kt.pfnMakeResidentCb(d.rt_device.handle, &resident);
+    if (hr == E_PENDING) {
+        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait{};
+        wait.ObjectCount = 1;
+        wait.ObjectHandleArray = &d.paging_fence;
+        wait.FenceValueArray = &resident.PagingFenceValue;
+        hr = d.kt.pfnWaitForSynchronizationObjectFromCpuCb(d.rt_device.handle, &wait);
+    }
+    if (FAILED(hr)) {
+        VGD_WARN("Present: MakeResidentCb(0x%x) failed: 0x%08lx", r->allocation, hr);
+        return hr;
+    }
+    // MakeResident counts references. Hold one until this allocation is freed.
+    r->present_resident = true;
+    VGD_TRACE("Present: allocation 0x%x is resident", r->allocation);
+    return S_OK;
 }
 
 } // namespace
@@ -83,11 +123,12 @@ HRESULT create_shared_surface(Device& d, const D3D11DDIARG_CREATERESOURCE& a, D3
     // Openers sample it and may render to it; DWM's primaries are render targets.
     const UINT bind = api_bind_flags(a.BindFlags) | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     const D3D11_TEXTURE2D_DESC1 desc = surface_desc(a.Format, width, height, bind);
+    // A legacy blt-model back buffer (presentable, neither shared nor a primary): dxgkrnl has the KMD copy it into the
+    // window with the CPU, so it lives in memory the KMD can map.
+    const bool blt_source = (a.BindFlags & D3D10_DDI_BIND_PRESENT) && !a.pPrimaryDesc &&
+                            !(a.MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED);
     int fd = -1;
-    // Legacy windowed presents copy into a standard allocation on the CPU.
-    const bool cpu_blt = (a.BindFlags & D3D10_DDI_BIND_PRESENT) && !a.pPrimaryDesc &&
-                         !(a.MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED);
-    HRESULT hr = surface_texture(d, desc, -1, 0, out, &fd, cpu_blt);
+    HRESULT hr = surface_texture(d, desc, -1, 0, out, &fd, blt_source);
     if (FAILED(hr)) {
         VGD_WARN("shared surface: %ux%u format %d failed: 0x%08lx", width, height, a.Format, hr);
         return hr;
@@ -123,6 +164,11 @@ HRESULT create_shared_surface(Device& d, const D3D11DDIARG_CREATERESOURCE& a, D3
     }
     out.allocation = info.hAllocation;
     out.allocated = true;
+    if (a.pPrimaryDesc || (a.BindFlags & D3D10_DDI_BIND_PRESENT)) {
+        hr = make_present_resident(d, &out);
+        if (FAILED(hr))
+            return hr;
+    }
     VGD_TRACE("shared surface: %ux%u format %d%s, allocation 0x%x (km resource 0x%x) aliases 0x%x (host resource "
               "%u): %llu bytes, pitch %u",
               width, height, a.Format, a.pPrimaryDesc ? " primary" : "", info.hAllocation, cb.hKMResource,
@@ -316,47 +362,6 @@ void destroy_render_fence(Device& d)
 namespace {
 
 // --- Present -------------------------------------------------------------------------------------------------
-
-HRESULT make_present_resident(Device& d, ResourceObject* r)
-{
-    if (!d.explicit_residency || !r || !r->allocation || r->present_resident)
-        return S_OK;
-    if (!d.kt.pfnCreatePagingQueueCb || !d.kt.pfnDestroyPagingQueueCb ||
-        !d.kt.pfnMakeResidentCb || !d.kt.pfnWaitForSynchronizationObjectFromCpuCb) {
-        VGD_WARN("Present: explicit residency callbacks are unavailable");
-        return E_NOTIMPL;
-    }
-    if (!d.paging_queue) {
-        D3DDDICB_CREATEPAGINGQUEUE queue{};
-        queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
-        const HRESULT hr = d.kt.pfnCreatePagingQueueCb(d.rt_device.handle, &queue);
-        if (FAILED(hr))
-            return hr;
-        d.paging_queue = queue.hPagingQueue;
-        d.paging_fence = queue.hSyncObject;
-    }
-    D3DDDI_MAKERESIDENT resident{};
-    resident.hPagingQueue = d.paging_queue;
-    resident.NumAllocations = 1;
-    resident.AllocationList = &r->allocation;
-    resident.Flags.CantTrimFurther = 1;
-    HRESULT hr = d.kt.pfnMakeResidentCb(d.rt_device.handle, &resident);
-    if (hr == E_PENDING) {
-        D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait{};
-        wait.ObjectCount = 1;
-        wait.ObjectHandleArray = &d.paging_fence;
-        wait.FenceValueArray = &resident.PagingFenceValue;
-        hr = d.kt.pfnWaitForSynchronizationObjectFromCpuCb(d.rt_device.handle, &wait);
-    }
-    if (FAILED(hr)) {
-        VGD_WARN("Present: MakeResidentCb(0x%x) failed: 0x%08lx", r->allocation, hr);
-        return hr;
-    }
-    // MakeResident counts references. Hold one until this allocation is freed.
-    r->present_resident = true;
-    VGD_TRACE("Present: allocation 0x%x is resident", r->allocation);
-    return S_OK;
-}
 
 HRESULT present_allocations(Device& d, D3DKMT_HANDLE src, D3DKMT_HANDLE dst, void* dxgi_context)
 {

@@ -477,10 +477,6 @@ NTSTATUS VioGpuAllocation::MapForCpuCopy(ULONG ctx_id,
 {
     PAGED_CODE();
 
-    // The original allocation owns the blob's shared-memory range and mapping.
-    if (m_alias_source)
-        return m_alias_source->MapForCpuCopy(ctx_id, map_va, map_size, io_mapping);
-
     if (!map_va || !map_size || !io_mapping)
     {
         return STATUS_INVALID_PARAMETER;
@@ -489,6 +485,12 @@ NTSTATUS VioGpuAllocation::MapForCpuCopy(ULONG ctx_id,
     *map_va = NULL;
     *map_size = 0;
     *io_mapping = FALSE;
+
+    // The source owns the host resource and its mapping.
+    if (m_alias_source)
+    {
+        return m_alias_source->MapForCpuCopy(ctx_id, map_va, map_size, io_mapping);
+    }
 
     if (m_is_blob)
     {
@@ -826,6 +828,13 @@ NTSTATUS VioGpuAllocation::GetStandardAllocationDriverData(DXGKARG_GETSTANDARDAL
 
                 allocationExchange->ResourceOptions.flags |= VIRGL_RESOURCE_FLAG_MAP_COHERENT;
 
+                if (pStandardAllocation->pResourcePrivateDriverData)
+                {
+                    VIOGPU_CREATE_RESOURCE_EXCHANGE *resourceExchange =
+                        (VIOGPU_CREATE_RESOURCE_EXCHANGE *)pStandardAllocation->pResourcePrivateDriverData;
+                    resourceExchange->magic = VIOGPU_RESOURCE_STAGING_SURFACE_MAGIC;
+                }
+
                 surfaceData->Pitch = surfaceData->Width * 4;
                 DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s staging surface\n", __FUNCTION__));
                 return STATUS_SUCCESS;
@@ -958,6 +967,18 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
     allocationInfo->PreferredSegment.Direction0 = 0;
 
     allocationInfo->Flags.CpuVisible = TRUE;
+    /* CDD's staging surfaces are guest RAM that GDI reads with the CPU on every
+     * legacy blt present; mapped write-combined that copy ran at ~100 MB/s
+     * (~50 ms for a full window). Map them cached, as the host and our MDL
+     * mappings access guest RAM. Only these: making every non-blob allocation
+     * cached left the boot display stuck.
+     */
+    const VIOGPU_CREATE_RESOURCE_EXCHANGE *standardResource =
+        (const VIOGPU_CREATE_RESOURCE_EXCHANGE *)pCreateAllocation->pPrivateDriverData;
+    allocationInfo->Flags.Cached =
+        !is_blob && standardResource &&
+        pCreateAllocation->PrivateDriverDataSize == sizeof(VIOGPU_CREATE_RESOURCE_EXCHANGE) &&
+        standardResource->magic == VIOGPU_RESOURCE_STAGING_SURFACE_MAGIC;
 #if VIOGPU_WDDM2
     /* Render and BLT Present still use physical allocation lists. WDDM 2
      * allocations referenced through those lists must explicitly permit
@@ -1000,10 +1021,11 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
 
     pDescribeAllocation->Format = VioGpuToD3DDDIColorFormat(m_options.format);
 
-    // this values are RANDOM
-    pDescribeAllocation->MultisampleMethod.NumQualityLevels = 2;
-    pDescribeAllocation->MultisampleMethod.NumSamples = 2;
+    // dxgkrnl reads this for the blits it builds itself (legacy blt-model presents).
+    pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
+    pDescribeAllocation->MultisampleMethod.NumSamples = max(m_options.nr_samples, 1u);
 
+    // 60 Hz, the only mode we report.
     pDescribeAllocation->RefreshRate.Numerator = 148500000;
     pDescribeAllocation->RefreshRate.Denominator = 2475000;
 

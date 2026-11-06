@@ -5,7 +5,6 @@ GPU through Venus.
 
 <img width="2494" height="1600" alt="image" src="https://github.com/user-attachments/assets/e7d4d665-e9e5-4303-8c13-f6ba02637a70" />
 
-
 ## How it works
 
 
@@ -26,93 +25,58 @@ GPU through Venus.
 
 Tested with QEMU 11.1.1 and virglrenderer 1.3.0 on RADV (AMD Strix Halo).
 
-- QEMU with Venus support in virtio-gpu (the `venus` property). virglrenderer must be built with Venus
-  (`-Dvenus=true`).
+- QEMU with Venus support in virtio-gpu. virglrenderer must be built with Venus (`-Dvenus=true`).
 - A host Vulkan driver.
 
-The virtio-gpu device needs `venus`, `blob` and a `hostmem` window:
+Setup: [with libvirt (virt-manager)](docs/libvirt.md) or [with QEMU directly](docs/qemu.md).
+For Intel guest PAT setup, Virtio input, and GTK cursor diagnostics, see [virt-manager and SPICE](docs/virt-manager.md).
 
-```
--machine q35,memory-backend=mem
--object memory-backend-memfd,id=mem,size=8G,share=on
--device virtio-vga-gl,venus=on,blob=on,hostmem=4G
--accel kvm,honor-guest-pat=on  # needed on Intel hosts with a discrete GPU
--display gtk,gl=on            # or SPICE with gl=on
-```
+We aim for no host patches. However, each way of displaying the guest has a drawback:
 
-On Intel hosts with a discrete GPU, KVM must honor the guest's page attribute table (PAT). This keeps the guest
-CPU mappings consistent with the host's cache attributes. Use Linux 6.16 or later and QEMU 11.0 or later with the
-`honor-guest-pat` option, as described in [Mesa's Venus requirements](https://docs.mesa3d.org/drivers/venus.html).
-Add `honor-guest-pat=on` to the existing `-accel kvm` argument. Without it, CPU uploads can contain stale data,
-which can cause corrupted desktop surfaces and cursors even when Vulkan device creation succeeds.
-
-With libvirt, which has no attribute for `venus`, set it through an override on the video device:
-
-```xml
-<memoryBacking>
-  <source type='memfd'/>
-  <access mode='shared'/>
-</memoryBacking>
-...
-<graphics type='spice'>
-  <listen type='none'/>
-  <image compression='off'/>
-  <jpeg compression='never'/>
-  <zlib compression='never'/>
-  <playback compression='off'/>
-  <streaming mode='off'/>
-  <mouse mode='server'/>
-  <gl enable='yes' rendernode='/dev/dri/renderD128'/>
-</graphics>
-<video>
-  <model type='virtio' heads='1' primary='yes' blob='on'>
-    <acceleration accel3d='yes'/>
-  </model>
-</video>
-...
-<qemu:override>
-  <qemu:device alias='video0'>
-    <qemu:frontend>
-      <qemu:property name='venus' type='bool' value='true'/>
-      <qemu:property name='hostmem' type='unsigned' value='4294967296'/>
-    </qemu:frontend>
-  </qemu:device>
-</qemu:override>
-```
-
-For a complete virt-manager setup, including a persistent guest PAT option and Virtio tablet input,
-see [virt-manager and SPICE](docs/virt-manager.md).
-
-For lower input latency, we recommend virtio input devices in place of the emulated PS/2 and USB ones (the guest
-needs virtio-win's `vioinput` driver). If convenient, also avoid virt-manager and spice display, in favor of QEMU GTK window.
-
+1. **virt-manager (libvirt + SPICE).** A bit laggy. After every frame, stock QEMU holds all of the guest's GPU
+   commands until the SPICE client has drawn it. QEMU needs yttrium's patch
+   ([cf3bba5c26](https://github.com/arehnman/yttrium-qemu/commit/cf3bba5c26), "ui: decouple GL presentation from
+   renderer blocking").
+2. **QEMU GTK** (`-display gtk,gl=on`). Smooth, but GTK 3 draws only at integer scales, so on a fractionally scaled
+   host display the compositor resamples the window and text looks slightly soft.
+3. **QEMU SDL** (`-display sdl,gl=on`). The best option out of the box, smooth and pixel-exact, but the hardware cursor shows a bit larger. SDL scales it twice, once by host scaling and once by guest.
 
 ### Guest
 
 - Windows 11, x64. Tested on 25H2.
-- Secure Boot off and test signing on (`bcdedit /set testsigning on`). Or you buy me a Windows driver certificate.
+- Secure Boot off. Or you buy me a Windows driver certificate.
 
-## Building and installing
+## Installing
 
-Everything builds on a Linux host inside `nix develop` (see `flake.nix`):
+Run `vgd-setup.exe` in the guest. Download builds from the [Actions](https://github.com/Aleksanaa/virtio-win-dx12/actions)
+page and tagged releases.
+
+Do take a VM snapshot first.
+
+## Building
+
+Everything builds on a Linux host inside `nix develop` (see `flake.nix`).
+
+The KMD and the Mesa drivers:
 
 ```
-cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --build build/win
+cmake/fetch-winkits.sh
 icd/build.sh
-cmake -S kmd -B build/kmd -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/clang-cl-kmd.cmake && ninja -C build/kmd
+cmake -S kmd -B build/kmd -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/cmake/clang-cl-kmd.cmake && ninja -C build/kmd
+cmake -S . -B build/win -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake && cmake --build build/win
 ```
 
-The WDK and SDK headers come from Microsoft's NuGet packages (Microsoft.Windows.WDK.x64 and
-Microsoft.Windows.SDK.CPP, 10.0.26100), extracted into `refs/winkits/{wdk,sdk}`.
+`cmake/fetch-winkits.sh` extracts the WDK and SDK headers from Microsoft's NuGet packages (Microsoft.Windows.WDK.x64
+and Microsoft.Windows.SDK.CPP, 10.0.26100) into `refs/winkits/{wdk,sdk}`. The KMD build test-signs `viogpu3d.sys`
+with the PFX in `VGD_KMD_SIGN_PFX`; any code signing certificate does, as the kernel accepts any signature in test
+mode. The installer is `build/win/setup/vgd-setup.exe` (`.github/workflows/build.yml` does the same).
 
-To install, make `build/` visible in the guest and run this from an elevated PowerShell in `build\win\tests\win`:
+For testing, make `build/` visible in the guest and run this from an elevated PowerShell in `build\win\tests\win`; it
+runs the installer silently and sets the drivers' logging up. Its top comment covers the other actions.
 
 ```
 powershell -ExecutionPolicy Bypass -File .\vgd-test.ps1 Install
 ```
-
-Then reboot. Take a VM snapshot first: DWM loads `vgd3d11.dll` as soon as the package is installed. The comment at
-the top of `vgd-test.ps1` covers Uninstall and recovery.
 
 ## Status
 

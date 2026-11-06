@@ -21,7 +21,7 @@ See [the pinned host device implementation](https://github.com/arehnman/virglren
 
 ## Repair
 
-Patch `0008-venus-defer-native-device-destruction.patch` adds one destruction ring per Windows instance.
+Patch `0010-venus-defer-native-device-destruction.patch` adds one destruction ring per Windows instance.
 Before it sends destruction, the ICD drains earlier primary-ring commands.
 This establishes object lifetime order without waiting for other devices' GPU work.
 Native destruction can then wait on the separate ring while CPU signals use the primary ring.
@@ -73,7 +73,7 @@ The source also builds on Linux with Vulkan headers, `-ldl`, and thread support 
 
 ## Isolated result on 2026-11-07
 
-A clean Mesa export with patches 0001 through 0008 produced the tested DLL.
+A clean Mesa export produced this tested DLL before the upstream sleep patches were integrated.
 Its SHA-256 hash is `cece5987fc607f6121f6d1be8e2fa45509a5e2019aa2e16eb29cf77780c446c7`.
 All five modes passed on the Windows VM without watchdog use.
 The failure-injection run returned `VK_ERROR_OUT_OF_HOST_MEMORY` and released all callback allocations.
