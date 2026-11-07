@@ -123,10 +123,15 @@ class VioGpuVidPN
     volatile LONG m_flippedResId = 0;
 
     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
+    NTSTATUS GetScanLine(DXGKARG_GETSCANLINE *pGetScanLine);
+    UINT GetRefreshRate()
+    {
+        return (UINT)InterlockedCompareExchange(&m_refreshRate, 0, 0);
+    }
 
   private:
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
-                                  CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath);
+                                  CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath, UINT refreshRate);
     NTSTATUS AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes);
     NTSTATUS AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INTERFACE *pVidPnSourceModeSetInterface,
                                  D3DKMDT_HVIDPNSOURCEMODESET hVidPnSourceModeSet,
@@ -136,7 +141,9 @@ class VioGpuVidPN
                                  _In_opt_ CONST D3DKMDT_VIDPN_SOURCE_MODE *pVidPnPinnedSourceModeInfo,
                                  D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId);
     D3DDDI_VIDEO_PRESENT_SOURCE_ID FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, BOOLEAN DefaultToZero);
-    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo);
+    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo,
+                              PVIDEO_MODE_INFORMATION pModeInfo, UINT refreshRate = 60);
+    VOID SetVsyncMode(UINT refreshRate, UINT height);
 
     VioGpuAdapter *m_pAdapter;
     DXGKRNL_INTERFACE *m_pDxgkInterface;
@@ -167,4 +174,9 @@ class VioGpuVidPN
     KDPC m_vsyncNotifyDpc;
     ULONG m_timerRes = 0;
     LARGE_INTEGER next_vsync_time = {0};
+    volatile LONG m_refreshRate = 60;
+    LONGLONG m_vsyncPeriod100ns = 10000000LL / 60;
+    ULONGLONG m_lastVsync100ns = 0;
+    UINT m_activeHeight = 768;
+    UINT m_totalHeight = 768 + 45;
 };

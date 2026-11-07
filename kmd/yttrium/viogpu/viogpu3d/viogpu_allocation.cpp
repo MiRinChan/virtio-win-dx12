@@ -1025,9 +1025,8 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
     pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
     pDescribeAllocation->MultisampleMethod.NumSamples = max(m_options.nr_samples, 1u);
 
-    // 60 Hz, the only mode we report.
-    pDescribeAllocation->RefreshRate.Numerator = 148500000;
-    pDescribeAllocation->RefreshRate.Denominator = 2475000;
+    pDescribeAllocation->RefreshRate.Numerator = m_adapter->vidpn.GetRefreshRate();
+    pDescribeAllocation->RefreshRate.Denominator = 1;
 
     return STATUS_SUCCESS;
 };
