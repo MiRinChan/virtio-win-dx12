@@ -79,7 +79,8 @@ int main(int argc, char** argv)
     std::printf("mode_test=%ld\n", status);
     if (status != DISP_CHANGE_SUCCESSFUL)
         return 1;
-    status = ChangeDisplaySettingsExW(nullptr, &selected, nullptr, 0, nullptr);
+    status = ChangeDisplaySettingsExW(nullptr, &selected, nullptr,
+                                     restore.keep ? CDS_UPDATEREGISTRY : 0, nullptr);
     std::printf("mode_apply=%ld\n", status);
     if (status != DISP_CHANGE_SUCCESSFUL)
         return 1;
