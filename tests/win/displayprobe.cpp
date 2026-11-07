@@ -84,7 +84,7 @@ int main(int argc, char** argv)
     if (status != DISP_CHANGE_SUCCESSFUL)
         return 1;
     restore.changed = true;
-    Sleep(1000);
+    Sleep(3000);
     DEVMODEW current = {};
     current.dmSize = sizeof(current);
     EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &current);
@@ -118,6 +118,8 @@ int main(int argc, char** argv)
     // WaitForVBlank measures kernel notifications, independently of renderer throughput.
     std::vector<double> intervals;
     LARGE_INTEGER previous, start, now;
+    for (unsigned i = 0; i < rate / 2; ++i)
+        output->WaitForVBlank();
     hr = output->WaitForVBlank();
     QueryPerformanceCounter(&previous);
     start = previous;
@@ -166,6 +168,10 @@ int main(int argc, char** argv)
     unsigned frames = 0;
     QueryPerformanceCounter(&start);
     now = start;
+    FILETIME present_start;
+    GetSystemTimePreciseAsFileTime(&present_start);
+    std::printf("present_start_filetime=%llu\n",
+                (static_cast<unsigned long long>(present_start.dwHighDateTime) << 32) | present_start.dwLowDateTime);
     while (SUCCEEDED(hr) && static_cast<double>(now.QuadPart - start.QuadPart) / frequency.QuadPart < seconds) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -179,6 +185,10 @@ int main(int argc, char** argv)
         QueryPerformanceCounter(&now);
     }
     const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / frequency.QuadPart;
+    FILETIME present_end;
+    GetSystemTimePreciseAsFileTime(&present_end);
+    std::printf("present_end_filetime=%llu\n",
+                (static_cast<unsigned long long>(present_end.dwHighDateTime) << 32) | present_end.dwLowDateTime);
     DWM_TIMING_INFO end = {};
     end.cbSize = sizeof(end);
     const HRESULT end_hr = DwmGetCompositionTimingInfo(nullptr, &end);
@@ -188,6 +198,9 @@ int main(int argc, char** argv)
                 SUCCEEDED(end_hr) ? end.cFrame - timing.cFrame : 0,
                 SUCCEEDED(end_hr) ? end.cRefresh - timing.cRefresh : 0);
     ok = ok && SUCCEEDED(hr) && frames > 0;
+    EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &current);
+    std::printf("end_mode=%lux%lu@%lu\n", current.dmPelsWidth, current.dmPelsHeight, current.dmDisplayFrequency);
+    ok = ok && current.dmDisplayFrequency == rate;
     if (target) target->Release();
     if (buffer) buffer->Release();
     if (swap) swap->Release();

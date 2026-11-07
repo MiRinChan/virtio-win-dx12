@@ -46,7 +46,7 @@ class VioGpuVidPN
     ~VioGpuVidPN();
 
     NTSTATUS Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren);
-    VOID StartVsyncTimer(void);
+    NTSTATUS StartVsyncTimer(void);
     VOID StopVsyncTimer(void);
     NTSTATUS Stop(void);
     NTSTATUS AcquirePostDisplayOwnership();
@@ -112,7 +112,7 @@ class VioGpuVidPN
                             _In_ INT PositionY);
 
     void Flip();
-    static void VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
+    static void VsyncNotifyTimerCallback(PEX_TIMER timer, PVOID deferredContext);
     PHYSICAL_ADDRESS GetCurrentSourceAddress() const
     {
         return m_sourceAddress;
@@ -131,7 +131,7 @@ class VioGpuVidPN
 
   private:
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
-                                  CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath, UINT refreshRate);
+                                  CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath);
     NTSTATUS AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMODES *CONST pRecommendMonitorModes);
     NTSTATUS AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INTERFACE *pVidPnSourceModeSetInterface,
                                  D3DKMDT_HVIDPNSOURCEMODESET hVidPnSourceModeSet,
@@ -170,9 +170,7 @@ class VioGpuVidPN
 
     volatile LONG m_shouldFlipStop = 1;
     KSPIN_LOCK m_vsyncTimerLock;
-    KTIMER m_vsyncNotifyTimer;
-    KDPC m_vsyncNotifyDpc;
-    ULONG m_timerRes = 0;
+    PEX_TIMER m_vsyncNotifyTimer = NULL;
     LARGE_INTEGER next_vsync_time = {0};
     volatile LONG m_refreshRate = 60;
     LONGLONG m_vsyncPeriod100ns = 10000000LL / 60;

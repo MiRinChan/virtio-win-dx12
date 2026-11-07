@@ -544,7 +544,12 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
                         status = StartWorkThread();
                         if (NT_SUCCESS(status))
                         {
-                            vidpn.StartVsyncTimer();
+                            status = vidpn.StartVsyncTimer();
+                            if (!NT_SUCCESS(status))
+                            {
+                                StopWorkThread();
+                                VioGpuAdapterClose();
+                            }
                         }
                         else
                         {

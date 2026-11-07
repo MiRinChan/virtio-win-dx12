@@ -42,8 +42,6 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
 
     m_SystemDisplaySourceId = D3DDDI_ID_UNINITIALIZED;
     KeInitializeSpinLock(&m_vsyncTimerLock);
-    KeInitializeTimerEx(&m_vsyncNotifyTimer, SynchronizationTimer);
-    KeInitializeDpc(&m_vsyncNotifyDpc, VioGpuVidPN::VsyncNotifyTimerDpc, this);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -53,6 +51,7 @@ VioGpuVidPN::~VioGpuVidPN()
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
+    StopVsyncTimer();
     DestroyFrameBufferObj(TRUE);
 
     delete[] m_ModeInfo;
@@ -129,8 +128,7 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     DbgPrint(TRACE_LEVEL_INFORMATION,
              ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentModes[0].DispInfo.ColorFormat));
 
-    StartVsyncTimer();
-    return Status;
+    return StartVsyncTimer();
 }
 
 NTSTATUS VioGpuVidPN::Stop(void)
@@ -383,11 +381,12 @@ NTSTATUS VioGpuVidPN::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitV
             Status = STATUS_GRAPHICS_INVALID_VIDEO_PRESENT_TARGET_MODE;
             goto CommitVidPnExit;
         }
-        Status = SetSourceModeAndPath(pPinnedVidPnSourceModeInfo, pVidPnPresentPath, refreshRate);
+        Status = SetSourceModeAndPath(pPinnedVidPnSourceModeInfo, pVidPnPresentPath);
         if (!NT_SUCCESS(Status))
         {
             goto CommitVidPnExit;
         }
+        SetVsyncMode(refreshRate, pPinnedVidPnTargetModeInfo->VideoSignalInfo.ActiveSize.cy);
 
         Status = pVidPnTargetModeSetInterface->pfnReleaseModeInfo(hVidPnTargetModeSet,
                                                                   pPinnedVidPnTargetModeInfo);
@@ -456,7 +455,7 @@ CommitVidPnExit:
 }
 
 NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
-                                           CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath, UINT refreshRate)
+                                           CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath)
 {
     PAGED_CODE();
 
@@ -497,10 +496,6 @@ NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSou
         }
     }
 
-    if (NT_SUCCESS(Status))
-    {
-        SetVsyncMode(refreshRate, pCurrentMode->DispInfo.Height);
-    }
     return Status;
 }
 
@@ -2063,24 +2058,27 @@ PAGED_CODE_SEG_END
 #pragma code_seg(push)
 #pragma code_seg()
 
-VOID VioGpuVidPN::StartVsyncTimer(void)
+NTSTATUS VioGpuVidPN::StartVsyncTimer(void)
 {
     ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
 
-    if (!m_timerRes)
+    if (!m_vsyncNotifyTimer)
     {
-        m_timerRes = ExSetTimerResolution(10000, TRUE);
+        m_vsyncNotifyTimer = ExAllocateTimer(VsyncNotifyTimerCallback, this, EX_TIMER_HIGH_RESOLUTION);
+        if (!m_vsyncNotifyTimer)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&m_vsyncTimerLock, &oldIrql);
     m_lastVsync100ns = VsyncTime100ns();
     next_vsync_time.QuadPart = m_lastVsync100ns + m_vsyncPeriod100ns;
-    LARGE_INTEGER due;
-    due.QuadPart = -m_vsyncPeriod100ns;
     InterlockedExchange(&m_shouldFlipStop, 0);
-    KeSetTimerEx(&m_vsyncNotifyTimer, due, 0, &m_vsyncNotifyDpc);
+    ExSetTimer(m_vsyncNotifyTimer, -m_vsyncPeriod100ns, 0, NULL);
     KeReleaseSpinLock(&m_vsyncTimerLock, oldIrql);
+    return STATUS_SUCCESS;
 }
 
 VOID VioGpuVidPN::StopVsyncTimer(void)
@@ -2090,15 +2088,13 @@ VOID VioGpuVidPN::StopVsyncTimer(void)
     KIRQL oldIrql;
     KeAcquireSpinLock(&m_vsyncTimerLock, &oldIrql);
     InterlockedExchange(&m_shouldFlipStop, 1);
-    KeCancelTimer(&m_vsyncNotifyTimer);
     KeReleaseSpinLock(&m_vsyncTimerLock, oldIrql);
 
-    KeFlushQueuedDpcs();
-
-    if (m_timerRes)
+    if (m_vsyncNotifyTimer)
     {
-        ExSetTimerResolution(m_timerRes, FALSE);
-        m_timerRes = 0;
+        // Wait for an active callback before the adapter or its scanout is freed.
+        ExDeleteTimer(m_vsyncNotifyTimer, TRUE, TRUE, NULL);
+        m_vsyncNotifyTimer = NULL;
     }
 }
 
@@ -2114,9 +2110,7 @@ VOID VioGpuVidPN::SetVsyncMode(UINT refreshRate, UINT height)
     next_vsync_time.QuadPart = m_lastVsync100ns + m_vsyncPeriod100ns;
     if (!m_shouldFlipStop)
     {
-        LARGE_INTEGER due;
-        due.QuadPart = -m_vsyncPeriod100ns;
-        KeSetTimerEx(&m_vsyncNotifyTimer, due, 0, &m_vsyncNotifyDpc);
+        ExSetTimer(m_vsyncNotifyTimer, -m_vsyncPeriod100ns, 0, NULL);
     }
     KeReleaseSpinLock(&m_vsyncTimerLock, oldIrql);
 }
@@ -2160,11 +2154,9 @@ void VioGpuVidPN::Flip()
     }
 }
 
-void VioGpuVidPN::VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2)
+void VioGpuVidPN::VsyncNotifyTimerCallback(PEX_TIMER timer, PVOID deferredContext)
 {
-    UNREFERENCED_PARAMETER(dpc);
-    UNREFERENCED_PARAMETER(systemArg1);
-    UNREFERENCED_PARAMETER(systemArg2);
+    UNREFERENCED_PARAMETER(timer);
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(deferredContext);
     if (!vidpn || InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0)
@@ -2192,9 +2184,7 @@ void VioGpuVidPN::VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID sy
         }
         vidpn->m_lastVsync100ns = now;
         vidpn->next_vsync_time.QuadPart = next;
-        LARGE_INTEGER due;
-        due.QuadPart = -(next - now);
-        KeSetTimerEx(&vidpn->m_vsyncNotifyTimer, due, 0, &vidpn->m_vsyncNotifyDpc);
+        ExSetTimer(vidpn->m_vsyncNotifyTimer, -(next - now), 0, NULL);
     }
     KeReleaseSpinLockFromDpcLevel(&vidpn->m_vsyncTimerLock);
 }
