@@ -9,15 +9,17 @@ The guest needs a virtio-gpu device with `venus`, `blob` and a `hostmem` window.
 
 ```
 -machine q35,memory-backend=mem
+-accel kvm,honor-guest-pat=on  # Intel hosts, see below
 -object memory-backend-memfd,id=mem,size=8G,share=on
 -device virtio-vga-gl,venus=on,blob=on,hostmem=4G
--accel kvm,honor-guest-pat=on  # needed on Intel hosts with a discrete GPU
 -display sdl,gl=on            # or gtk,gl=on
 ```
 
-Intel hosts with a discrete GPU need KVM to honor the guest's page attribute table (PAT).
-This keeps CPU mappings consistent with the host cache attributes.
-Use Linux 6.16 or later and QEMU 11.0 or later with `honor-guest-pat=on`.
+Intel hosts need `honor-guest-pat=on` to honor the guest's page attribute table (PAT), including hosts with a discrete GPU.
+Without it, KVM on Intel maps the `hostmem` window write-back.
+The guest's write-combined views of host GPU memory are then incoherent with the iGPU.
+KVM on AMD always honors these attributes, so AMD hosts do not need this setting.
+Use Linux 6.16 or later and QEMU 11.0 or later.
 Add the property to the existing `-accel kvm` argument.
 See [Mesa's Venus requirements](https://docs.mesa3d.org/drivers/venus.html#requirements).
 
