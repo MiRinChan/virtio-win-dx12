@@ -46,7 +46,7 @@ class VioGpuVidPN
     ~VioGpuVidPN();
 
     NTSTATUS Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren);
-    NTSTATUS StartVsyncTimer(void);
+    VOID StartVsyncTimer(void);
     VOID StopVsyncTimer(void);
     NTSTATUS Stop(void);
     NTSTATUS AcquirePostDisplayOwnership();
@@ -112,7 +112,7 @@ class VioGpuVidPN
                             _In_ INT PositionY);
 
     void Flip();
-    static void VsyncNotifyTimerCallback(PEX_TIMER timer, PVOID deferredContext);
+    static void VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
     PHYSICAL_ADDRESS GetCurrentSourceAddress() const
     {
         return m_sourceAddress;
@@ -123,11 +123,6 @@ class VioGpuVidPN
     volatile LONG m_flippedResId = 0;
 
     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
-    NTSTATUS GetScanLine(DXGKARG_GETSCANLINE *pGetScanLine);
-    UINT GetRefreshRate()
-    {
-        return (UINT)InterlockedCompareExchange(&m_refreshRate, 0, 0);
-    }
 
   private:
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
@@ -141,9 +136,7 @@ class VioGpuVidPN
                                  _In_opt_ CONST D3DKMDT_VIDPN_SOURCE_MODE *pVidPnPinnedSourceModeInfo,
                                  D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId);
     D3DDDI_VIDEO_PRESENT_SOURCE_ID FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, BOOLEAN DefaultToZero);
-    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo,
-                              PVIDEO_MODE_INFORMATION pModeInfo, UINT refreshRate = 60);
-    VOID SetVsyncMode(UINT refreshRate, UINT height);
+    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo);
 
     VioGpuAdapter *m_pAdapter;
     DXGKRNL_INTERFACE *m_pDxgkInterface;
@@ -170,11 +163,8 @@ class VioGpuVidPN
 
     volatile LONG m_shouldFlipStop = 1;
     KSPIN_LOCK m_vsyncTimerLock;
-    PEX_TIMER m_vsyncNotifyTimer = NULL;
+    KTIMER m_vsyncNotifyTimer;
+    KDPC m_vsyncNotifyDpc;
+    ULONG m_timerRes = 0;
     LARGE_INTEGER next_vsync_time = {0};
-    volatile LONG m_refreshRate = 60;
-    LONGLONG m_vsyncPeriod100ns = 10000000LL / 60;
-    ULONGLONG m_lastVsync100ns = 0;
-    UINT m_activeHeight = 768;
-    UINT m_totalHeight = 768 + 45;
 };

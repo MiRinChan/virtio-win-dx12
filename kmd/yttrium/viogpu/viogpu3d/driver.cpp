@@ -1333,7 +1333,9 @@ VioGpu3DDdiGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *
         return STATUS_UNSUCCESSFUL;
     }
 
-    return pAdapter->vidpn.GetScanLine(pGetScanLine);
+    pGetScanLine->InVerticalBlank = FALSE;
+    pGetScanLine->ScanLine = 0;
+    return STATUS_SUCCESS;
 }
 
 // END: Paged Code
